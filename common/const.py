@@ -1,0 +1,1 @@
+WITHOUT_SERIAL="No Serial Port Detected"
