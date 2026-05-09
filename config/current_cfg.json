@@ -1,0 +1,14 @@
+{
+  "cfg": [
+    {
+      "id": "b1c2fa72-e79a-451b-9884-4ff3a4bb420e",
+      "tag_code": "air_temperature",
+      "slave_id": 1,
+      "reg_address": 1,
+      "count": 1,
+      "data_type": "uint16",
+      "scale": 0.1
+    }
+  ],
+  "freq": 10
+}

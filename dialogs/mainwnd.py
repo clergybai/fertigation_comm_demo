@@ -1,11 +1,17 @@
-from PyQt5.QtWidgets import QComboBox, QFrame, QHBoxLayout, QLabel, QMainWindow, QMessageBox, QPushButton, QSpinBox, QStatusBar, QVBoxLayout, QWidget
+import time
+import json
+
+from PyQt5.QtWidgets import QAction, QApplication, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QMainWindow, QMenu, QMessageBox, QPushButton, QSpinBox, QStatusBar, QVBoxLayout, QWidget, QLineEdit
 from modbus.modbus_rtu import AsyncModbusRTUClient, ModbusRTUClient
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import QTimer, Qt
 import serial.tools.list_ports
 from widgets.combobox import BaudrateComboBox, ConverterComboBox, DataBitsComboBox, ParityComboBox, StopBitsComboBox
-from common.const import WITHOUT_SERIAL
+from common.const import WITHOUT_SERIAL, CONFIG_FILE
 from widgets.lineedit import HexAddressInput
 from widgets.spinbox import SlaveIdSpinBox
+from common.mqtt import MqttClient
+from PyQt5.QtCore import QSettings
+import os
 
 
 class MainWindow(QMainWindow):
@@ -13,9 +19,28 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super(MainWindow, self).__init__()
         self.setWindowTitle("Modbus RTU Client Tool")
+        
+        # 初始化 QSettings（推荐使用组织名 + 应用名）
+        self.settings = QSettings("Kunlunbot", "ModbusRTUClientTool")
+        
+        self.config_file = CONFIG_FILE
+        
         self.client = None
         self.selected_port = None
+        self.ca_cert_pem = None  # 用于存储加载的 CA 证书内容
+        self.mqtt = MqttClient()
+        
+        self.current_cfg = []
+        self.freq_seconds = 300
+        self.read_timer = QTimer()
+        self.read_timer.timeout.connect(self.read_modbus_by_cfg)
+        self.current_output = None
+        self.pause_mqtt_publish = False
+        
         self.initUI()
+        # 程序启动后立即加载上次的配置
+        self.load_mqtt_settings()
+        self.load_current_cfg() 
         
     def initUI(self):
         self.setGeometry(100, 100, 1024, 768)
@@ -25,7 +50,9 @@ class MainWindow(QMainWindow):
         self.create_serial_panel()
         self.create_input_panel()
         self.create_output_panel()
+        self.create_realtime_data_panel()
         self.create_status_bar()
+        self.create_mqtt_panel()
         
     def create_serial_panel(self):
         title = QLabel("Select a serial")
@@ -116,29 +143,58 @@ class MainWindow(QMainWindow):
         v_layout.addWidget(self.result_label)
         self.main_layout.addLayout(v_layout)
     
+    def create_realtime_data_panel(self):
+        """创建实时数据 LED 显示面板"""
+        group = QFrame()
+        group.setFrameShape(QFrame.StyledPanel)
+        group.setStyleSheet("QFrame { background-color: #1e1e1e; border: 1px solid #444; }")
+        
+        layout = QVBoxLayout(group)
+        
+        title = QLabel("实时数据 (Real-time Data)")
+        title.setStyleSheet("font-weight: bold; font-size: 15px; color: #00ffcc; padding: 5px;")
+        layout.addWidget(title)
+
+        # 用于显示数据的容器
+        self.realtime_display = QVBoxLayout()
+        layout.addLayout(self.realtime_display)
+
+        self.main_layout.addWidget(group)
+    
     def create_status_bar(self):
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
-        
         self.status_bar.setStyleSheet("QStatusBar { background-color: azure; }")
         
         # 1. 最左侧：用于显示临时操作状态（新增）
         self.status_message_label = QLabel("")
-        self.status_message_label.setMinimumWidth(400)   # 根据需要调整宽度
+        self.status_message_label.setMinimumWidth(380)   # 根据需要调整宽度
         self.status_bar.addWidget(self.status_message_label, 0)   # stretch=0，不扩展
         
-        # 2. 中间居中的版权信息
+        # 2. MQTT 连接状态
+        self.mqtt_status_label = QLabel("MQTT: 未连接")
+        self.mqtt_status_label.setStyleSheet("color: #666666;")
+        self.status_bar.addWidget(self.mqtt_status_label, 0)
+        
+        # 3. 设备 SN 显示（永久显示）
+        self.sn_label = QLabel("SN: ------")
+        self.sn_label.setStyleSheet("color: #0066cc; font-weight: bold;")
+        self.sn_label.setContextMenuPolicy(Qt.CustomContextMenu)        # 关键：启用自定义右键菜单
+        self.sn_label.customContextMenuRequested.connect(self.show_sn_context_menu)  # 连接右键信号
+        self.status_bar.addWidget(self.sn_label, 0)
+        
+        # 4. 中间居中的版权信息
         copyright_label = QLabel("Copyright © 2026 H&B Asia & Kunlunbot. All Rights Reserved.")
         copyright_label.setAlignment(Qt.AlignCenter)
         self.status_bar.addWidget(copyright_label, 1)   # stretch=1，让它占据中间空间并居中
         
-        # 3. 分隔符（竖线）
+        # 5. 分隔符（竖线）
         separator = QFrame()
         separator.setFrameShape(QFrame.VLine)
         separator.setFrameShadow(QFrame.Sunken)
         self.status_bar.addWidget(separator)
         
-        # 4. 右边的软件作者信息
+        # 6. 右边的软件作者信息
         author_label = QLabel('Author: <a href="mailto:yonghao.bai@kunlunbot.cn">Yonghao Bai</a>')
         author_label.setOpenExternalLinks(True)
         author_label.setAlignment(Qt.AlignRight)
@@ -155,8 +211,179 @@ class MainWindow(QMainWindow):
         """)
         
         self.status_bar.addWidget(author_label)
-        
     
+    def create_mqtt_panel(self):
+        group = QFrame()
+        group.setFrameShape(QFrame.StyledPanel)
+        layout = QVBoxLayout(group)
+
+        title = QLabel("MQTT Broker 配置")
+        title.setStyleSheet("font-weight: bold; font-size: 14px;")
+
+        # Broker 地址
+        broker_layout = QHBoxLayout()
+        broker_layout.addWidget(QLabel("Broker:"))
+        self.mqtt_broker_input = QLineEdit("broker.emqx.io")
+        self.mqtt_broker_input.setMinimumWidth(250)
+        broker_layout.addWidget(self.mqtt_broker_input)
+
+        # Port + Tenant ID + Freq
+        config_layout = QHBoxLayout()
+        
+        # Port
+        config_layout.addWidget(QLabel("Port:"))
+        self.mqtt_port_input = QSpinBox()
+        self.mqtt_port_input.setRange(1, 65535)
+        self.mqtt_port_input.setValue(8883)
+        config_layout.addWidget(self.mqtt_port_input)
+
+        # Tenant ID
+        config_layout.addSpacing(20)
+        config_layout.addWidget(QLabel("Tenant ID:"))
+        self.mqtt_tenant_id_input = QLineEdit()
+        self.mqtt_tenant_id_input.setPlaceholderText("输入 Tenant ID")
+        self.mqtt_tenant_id_input.setMinimumWidth(150)
+        config_layout.addWidget(self.mqtt_tenant_id_input)
+
+        # 新增：读取频率
+        config_layout.addSpacing(30)
+        config_layout.addWidget(QLabel("Read Freq (sec):"))
+        self.freq_input = QSpinBox()
+        self.freq_input.setRange(1, 3600)        # 1秒 ~ 1小时
+        self.freq_input.setValue(300)
+        self.freq_input.setSingleStep(10)
+        self.freq_input.valueChanged.connect(self.on_freq_changed)   # 实时响应修改
+        config_layout.addWidget(self.freq_input)
+
+        # CA + Username + Password 放在同一行
+        auth_layout = QHBoxLayout()
+        
+        # CA Certificate
+        auth_layout.addWidget(QLabel("CA Certificate:"))
+        self.mqtt_ca_btn = QPushButton("Browse CA File")
+        self.mqtt_ca_btn.clicked.connect(self.browse_ca_file)
+        self.ca_status_label = QLabel("未加载 CA")
+        self.ca_status_label.setStyleSheet("color: gray;")
+        auth_layout.addWidget(self.mqtt_ca_btn)
+        auth_layout.addWidget(self.ca_status_label)
+
+        # Username
+        auth_layout.addSpacing(30)                    # 增加一些间距
+        auth_layout.addWidget(QLabel("Username:"))
+        self.mqtt_username_input = QLineEdit()
+        self.mqtt_username_input.setMinimumWidth(120)
+        auth_layout.addWidget(self.mqtt_username_input)
+
+        # Password
+        auth_layout.addWidget(QLabel("Password:"))
+        self.mqtt_password_input = QLineEdit()
+        self.mqtt_password_input.setEchoMode(QLineEdit.Password)   # 密码隐藏
+        self.mqtt_password_input.setMinimumWidth(120)
+        auth_layout.addWidget(self.mqtt_password_input)
+
+        # 连接按钮
+        btn_layout = QHBoxLayout()
+        self.mqtt_connect_btn = QPushButton("连接 MQTT")
+        self.mqtt_connect_btn.clicked.connect(self.connect_mqtt)
+        self.mqtt_disconnect_btn = QPushButton("断开 MQTT")
+        self.mqtt_disconnect_btn.clicked.connect(self.disconnect_mqtt)
+        self.pause_mqtt_publish_btn = QPushButton("Pause MQTT Publish")
+        self.pause_mqtt_publish_btn.clicked.connect(self.toggle_mqtt_publish)
+        self.mannal_publish_btn = QPushButton("Manual Publish")
+        self.mannal_publish_btn.clicked.connect(self.manual_publish)
+        self.mqtt_disconnect_btn.setEnabled(False)
+        btn_layout.addWidget(self.mqtt_connect_btn)
+        btn_layout.addWidget(self.mqtt_disconnect_btn)
+        btn_layout.addWidget(self.pause_mqtt_publish_btn)
+        btn_layout.addWidget(self.mannal_publish_btn)
+        
+        layout.addWidget(title)
+        layout.addLayout(broker_layout)
+        layout.addLayout(config_layout) 
+        layout.addLayout(auth_layout)
+        layout.addLayout(btn_layout)
+
+        self.main_layout.addWidget(group)
+        
+        self.mqtt.device_sn_generated.connect(self.on_device_sn_generated) 
+        
+    def save_mqtt_settings(self):
+        """保存 MQTT 配置到本地文件"""
+        self.settings.setValue("mqtt/broker", self.mqtt_broker_input.text().strip())
+        self.settings.setValue("mqtt/port", self.mqtt_port_input.value())
+        self.settings.setValue("mqtt/tenant_id", self.mqtt_tenant_id_input.text().strip())
+        self.settings.setValue("mqtt/username", self.mqtt_username_input.text().strip())
+        self.settings.setValue("mqtt/ca_file_path", getattr(self, 'ca_file_path', ""))
+        
+        # 注意：密码不要明文保存（这里仅做演示，实际项目建议加密或不保存）
+        self.settings.setValue("mqtt/password", self.mqtt_password_input.text().strip())
+        
+        self.settings.sync()   # 立即写入磁盘
+
+    def load_mqtt_settings(self):
+        """从本地文件加载上次保存的 MQTT 配置"""
+        broker = self.settings.value("mqtt/broker", "broker.emqx.io")
+        port = self.settings.value("mqtt/port", 8883, type=int)
+        tenant_id = self.settings.value("mqtt/tenant_id", "")
+        username = self.settings.value("mqtt/username", "")
+        password = self.settings.value("mqtt/password", "")
+        ca_path = self.settings.value("mqtt/ca_file_path", "")
+
+        self.mqtt_broker_input.setText(broker)
+        self.mqtt_port_input.setValue(port)
+        self.mqtt_tenant_id_input.setText(tenant_id)   
+        self.mqtt_username_input.setText(username)
+        self.mqtt_password_input.setText(password)
+
+        if ca_path:
+            self.ca_file_path = ca_path
+            self.ca_status_label.setText(f"已加载: {ca_path.split('/')[-1]}")
+            self.ca_status_label.setStyleSheet("color: green;")
+            
+            # 如果需要同时加载证书内容（推荐）
+            try:
+                with open(ca_path, 'r', encoding='utf-8') as f:
+                    self.ca_cert_pem = f.read().strip()
+                self.mqtt.set_ca_cert(self.ca_cert_pem)
+            except:
+                pass  # 文件可能已被删除，不崩溃 
+    
+    def save_current_cfg(self):
+        """将当前 self.current_cfg 保存到本地 JSON 文件"""
+        try:
+            os.makedirs(os.path.dirname(self.config_file), exist_ok=True)
+            
+            with open(self.config_file, 'w', encoding='utf-8') as f:
+                json.dump({
+                    "cfg": self.current_cfg,
+                    "freq": self.freq_seconds
+                }, f, ensure_ascii=False, indent=2)
+            print(f"Saved current cfg to {self.config_file}")
+        except Exception as e:
+            print(f"保存 cfg 失败: {e}")
+            
+    def load_current_cfg(self):
+        """Load current cfg from local JSON file"""
+        try:
+            if not os.path.exists(self.config_file):
+                return
+            with open(self.config_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            self.current_cfg = data.get("cfg", {})
+            self.freq_seconds = data.get("freq", 300)
+            
+            self.freq_input.valueChanged.disconnect(self.on_freq_changed)
+            self.freq_input.setValue(self.freq_seconds)
+            self.freq_input.valueChanged.connect(self.on_freq_changed)  # 重新连接
+            
+            if self.current_cfg:
+                self.status_message_label.setText(f"load cfg | {len(self.current_cfg)} tags | freq: {self.freq_seconds}s")
+            print(f"Loaded current cfg from {self.config_file}")
+        except Exception as e:
+            print(f"加载 cfg 失败: {e}")
+            self.current_cfg = []
+            self.freq_seconds = 300
+
     def refresh_port(self):
         self.port_combo.clear()
         
@@ -181,6 +408,7 @@ class MainWindow(QMainWindow):
         if self.port_combo.currentText() == WITHOUT_SERIAL:
             QMessageBox.warning(self, "Warning", "No available serial port!")
             return
+        
         if self.client and self.client.connected:
             self.client.close()
             self.confirm_btn.setText("Open Serial Port")
@@ -197,8 +425,16 @@ class MainWindow(QMainWindow):
                 stopbits=self.stopbits_combo.get_current_stop_bits(),
                 slave_id=self.slave_id_spinbox.get_slave_id(),
                 timeout=1)
-            if not self.client.connect():
-                QMessageBox.critical(self, "Error", f"Unable to connect to serial port {self.selected_port}!")
+            if self.client.connect():
+                self.confirm_btn.setText("Close Serial Port")
+                self.status_message_label.setText(f"串口 {self.selected_port} 已打开")
+                
+                # 如果已经有配置，则启动定时读取
+                # if self.current_cfg and self.freq_seconds > 0:
+                #     self.read_timer.start(self.freq_seconds * 1000)
+                #     self.status_message_label.setText(f"串口打开，开始周期读取（{self.freq_seconds}s）")
+            else:
+                QMessageBox.critical(self, "Error", f"无法连接串口 {self.selected_port}!")
                 self.client = None
                 self.confirm_btn.setText("Open Serial Port")
         
@@ -215,6 +451,32 @@ class MainWindow(QMainWindow):
         little_endian = self.little_endian_combo.currentText() == "Little Endian"
         result = self.client.read_data(add=self.reg_addr_input.get_value(), count=self.reg_count_input.value(), converter=self.convert_combo.get_converter(), little_endian=little_endian)
         self.result_label.setText(f"Read Result: {result}")
+        
+        # --- 修改开始 ---
+        # if result is not None:
+        #     # 确保处理的是整数（对于光照等 32 位原始值）
+        #     val_int = int(result)
+            
+        #     # 1. 十六进制显示 (根据大小自动选择 4 位或 8 位)
+        #     hex_format = "0x{:08X}" if val_int > 0xFFFF else "0x{:04X}"
+        #     hex_str = hex_format.format(val_int)
+            
+        #     # 2. 二进制显示并按 8bit 分割
+        #     # bin(val_int)[2:] 去掉 '0b' 前缀
+        #     # zfill 补齐位数，如果是 32 位值就补齐 32 位，否则 16 位
+        #     total_bits = 32 if val_int > 0xFFFF else 16
+        #     bin_raw = bin(val_int)[2:].zfill(total_bits)
+            
+        #     # 每 8 位加一个空格分割
+        #     bin_str = " ".join([bin_raw[i:i+8] for i in range(0, len(bin_raw), 8)])
+            
+        #     # 3. 组合显示
+        #     display_text = f"Hex: {hex_str}\nBin: {bin_str}\nDec: {result}"
+        # else:
+        #     display_text = "Read Failed"
+
+        # self.result_label.setText(display_text)
+        # --- 修改结束 ---
 
     def update_endian_enabled(self):
         """当 Count >= 2 时启用 Endian ComboBox，否则禁用"""
@@ -227,3 +489,326 @@ class MainWindow(QMainWindow):
             self.little_endian_combo.setStyleSheet("QComboBox { color: gray; }")
         else:
             self.little_endian_combo.setStyleSheet("")
+
+    def browse_ca_file(self):
+        file_path, _ = QFileDialog.getOpenFileName(self, "Select CA Certificate", "", "Certificate Files (*.crt *.pem);;All Files (*)")
+        
+        if file_path:
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    ca_content = f.read().strip()
+                
+                self.ca_cert_pem = ca_content
+                self.mqtt.set_ca_cert(ca_content) 
+                QMessageBox.information(self, "CA Certificate Loaded", f"Successfully loaded CA certificate from:\n{file_path}")
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to load CA certificate:\n{str(e)}") 
+
+
+    def connect_mqtt(self):
+        username = self.mqtt_username_input.text().strip()
+        password = self.mqtt_password_input.text().strip()
+        tenant_id = self.mqtt_tenant_id_input.text().strip()
+        
+        self.mqtt.username = username if username else None
+        self.mqtt.password = password if password else None
+        self.status_message_label.setText("正在连接 MQTT Broker...")
+        
+        self.mqtt.broker = self.mqtt_broker_input.text().strip()
+        self.mqtt.port = self.mqtt_port_input.value()
+        self.mqtt.set_tenant_id(tenant_id)
+        if self.ca_cert_pem:
+            self.mqtt.set_ca_cert(self.ca_cert_pem)
+        
+        # 保存配置
+        self.save_mqtt_settings()
+        
+        self.mqtt.connected.connect(self.on_mqtt_connected)
+        self.mqtt.disconnected.connect(self.on_mqtt_disconnected)
+        self.mqtt.message_received.connect(self.on_mqtt_message_received)
+        self.mqtt.error_occurred.connect(self.on_mqtt_error)
+        
+        self.mqtt.connect_to_broker()
+
+    def disconnect_mqtt(self):
+        self.mqtt.disconnect()
+        self.mqtt_connect_btn.setEnabled(True)
+        self.mqtt_disconnect_btn.setEnabled(False)
+        
+    def toggle_mqtt_publish(self):
+        """切换 MQTT 发布的暂停/继续状态"""
+        self.pause_mqtt_publish = not self.pause_mqtt_publish
+        if self.pause_mqtt_publish:
+            self.pause_mqtt_publish_btn.setText("Resume MQTT Publish")
+            self.status_message_label.setText("MQTT 发布已暂停")
+        else:
+            self.pause_mqtt_publish_btn.setText("Pause MQTT Publish")
+            self.status_message_label.setText("MQTT 发布已恢复")
+    
+    def manual_publish(self):
+        """手动触发一次 MQTT 发布（如果有当前输出）"""
+        if self.current_output and self.mqtt.connected:
+            publish_topic = f"tenants/{self.mqtt_tenant_id_input.text().strip()}/devices/{self.mqtt.device_sn}/telemetry"
+            self.mqtt.publish(publish_topic, json.dumps(self.current_output), qos=1)
+            self.status_message_label.setText("Manual publish triggered")
+        else:
+            self.status_message_label.setText("No data to publish manually")
+    
+    def on_freq_changed(self, new_freq: int):
+        """用户手动修改读取频率时实时生效"""
+        self.freq_seconds = new_freq
+        
+        # 只有当串口已经打开时才启动定时器
+        if self.client and self.client.connected:
+            if self.read_timer.isActive():
+                self.read_timer.stop()
+            if new_freq > 0:
+                self.read_timer.start(new_freq * 1000)
+                self.status_message_label.setText(f"读取频率已修改为: {new_freq} 秒")
+        else:
+            self.status_message_label.setText(f"频率已设置为 {new_freq} 秒（串口未打开，暂不启动读取）")
+        
+        # 保存到配置文件
+        self.save_current_cfg()
+
+    # 信号槽
+    def on_mqtt_connected(self):
+        self.mqtt_status_label.setText("MQTT: ✅ connected")
+        self.mqtt_status_label.setStyleSheet("color: green; font-weight: bold;")
+        self.mqtt_connect_btn.setEnabled(False)
+        self.mqtt_disconnect_btn.setEnabled(True)
+        # self.status_message_label.setText("")  
+        # QMessageBox.information(self, "MQTT", "成功连接到 MQTT Broker！")
+        # 只有当串口已打开 且 有配置 时，才启动定时读取
+        if (self.client and self.client.connected and 
+            self.current_cfg and len(self.current_cfg) > 0 and 
+            self.freq_seconds > 0):
+            
+            self.read_timer.start(self.freq_seconds * 1000)
+            self.status_message_label.setText(f"MQTT 已连接，开始周期读取（每 {self.freq_seconds} 秒）")
+        else:
+            self.status_message_label.setText("MQTT 已连接，等待串口打开或配置下发...")
+
+    def on_mqtt_disconnected(self):
+        self.mqtt_status_label.setText("MQTT: ❌ disconnected")
+        self.mqtt_status_label.setStyleSheet("color: red; font-weight: bold;")
+        self.mqtt_connect_btn.setEnabled(True)
+        self.mqtt_disconnect_btn.setEnabled(False)
+        self.status_message_label.setText("")
+        if self.read_timer.isActive():
+            self.read_timer.stop()
+        if self.mqtt_tenant_id_input.text().strip():
+            self.status_message_label.setText(f"已订阅设备配置主题 (Tenant: {self.mqtt_tenant_id_input.text().strip()})")
+
+    def on_mqtt_message_received(self, topic, payload):
+        # 这里可以把收到的消息显示在界面上（你目前没有输出面板，可以自行添加 QTextEdit）
+        try:
+            data = json.loads(payload)
+            if "cfg" in data and isinstance(data.get("cfg"), list):
+                self.current_cfg = data["cfg"]
+                new_freq = data.get("freq", 300)
+                
+                # 更新内部变量
+                self.freq_seconds = new_freq
+                
+                # === 关键：同步更新界面上的频率输入框 ===
+                try:
+                    # 临时断开信号，避免触发 on_freq_changed 导致重复启动
+                    self.freq_input.valueChanged.disconnect(self.on_freq_changed)
+                    self.freq_input.setValue(new_freq)
+                    self.freq_input.valueChanged.connect(self.on_freq_changed)
+                except:
+                    # 如果信号未连接，直接设置值
+                    self.freq_input.setValue(new_freq)
+                
+                
+                self.status_message_label.setText(f"Receive cfg update | Frequency: {self.freq_seconds}s | tag number: {len(self.current_cfg)}")
+                
+                self.read_timer.stop()
+                if self.freq_seconds > 0:
+                    self.read_timer.start(self.freq_seconds * 1000)
+                
+                self.save_current_cfg()
+        except json.JSONDecodeError:
+            print(f"Received non-JSON MQTT message on topic {topic}: {payload}")
+        except Exception as e:
+            print(f"Error processing MQTT message: {e}")
+            
+    def read_modbus_by_cfg(self):
+        """ 根据当前 self.current_cfg 读取 Modbus 数据并通过 MQTT 发布结果 """
+        if not self.current_cfg:
+            return
+        if not self.client or not self.client.connected:
+            self.status_message_label.setText("warning: Modbus client not connected, cannot read data by cfg")
+            return
+        
+        result_dict = {}
+        
+        for item in self.current_cfg:
+            try:
+                sensor_id = item.get('id')
+                tag_code = item.get("tag_code")
+                slave_id = item.get("slave_id", 1)
+                reg_address = item.get("reg_address", 0)
+                count = item.get("count", 1)
+                data_type = item.get("data_type", "uint16")
+                scale = item.get("scale", 1.0)
+                
+                # 调用 Modbus 读取（注意：你的 ModbusRTUClient 需要支持 slave_id 参数）
+                read_timestamp = time.time_ns() 
+                value = self.client.read_data_with_slave(
+                    add=reg_address,
+                    count=count,
+                    converter=None,           # 我们自己处理转换
+                    little_endian=False,      # 可根据需要调整
+                    slave_id=slave_id         # 关键：指定 slave_id
+                )
+                # 根据 data_type 进行转换
+                converted = self.convert_modbus_value(value, data_type)
+                final_value = converted * scale if isinstance(converted, (int, float)) else converted
+                
+                result_dict[tag_code] = {
+                    "sensor_id": sensor_id,
+                    "value": final_value,
+                    "timestamp": read_timestamp
+                }
+            except Exception as e:
+                print(f"Reading {tag_code} failed: {e}")
+                result_dict[tag_code] = None
+        
+        # update LED display
+        self.update_realtime_display(result_dict)
+                
+        # 构建最终 JSON 并发布
+        output_json = {
+            "device_sn": self.mqtt.device_sn,
+            "timestamp": int(time.time()),
+            "data": result_dict
+        }
+        
+        # 发布结果（推荐发布到数据上报主题）
+        publish_topic = f"tenants/{self.mqtt_tenant_id_input.text().strip()}/devices/{self.mqtt.device_sn}/telemetry"
+        if not self.pause_mqtt_publish:
+            self.mqtt.publish(publish_topic, json.dumps(output_json), qos=1)
+        else:
+            self.current_output = output_json  # 暂存当前输出，等恢复发布时一起发布
+        self.status_message_label.setText(f"Read and published {len(result_dict)} tags")
+        print(f"Published to MQTT: {output_json}")
+        
+    def on_mqtt_error(self, error_msg):
+        self.status_message_label.setText(f"MQTT 错误: {error_msg}")
+        self.mqtt_status_label.setText("MQTT: 连接失败")
+        self.mqtt_status_label.setStyleSheet("color: red;")
+        
+    def on_device_sn_generated(self, sn: str):
+        """接收生成的设备 SN"""
+        self.sn_label.setText(f"SN: {sn}")
+        
+    def show_sn_context_menu(self, pos):
+        """右键 SN Label 时弹出菜单"""
+        if not hasattr(self.mqtt, 'device_sn') or not self.mqtt.device_sn:
+            return
+
+        menu = QMenu(self)
+
+        copy_action = QAction("复制 SN", self)
+        copy_action.triggered.connect(self.copy_sn_to_clipboard)
+        menu.addAction(copy_action)
+
+        # 可选：添加分隔线和其他功能
+        # menu.addSeparator()
+        # menu.addAction("刷新 SN", self.refresh_sn)   # 如果以后需要
+
+        # 在鼠标位置显示菜单
+        menu.exec_(self.sn_label.mapToGlobal(pos))
+
+    def copy_sn_to_clipboard(self):
+        """将当前 SN 复制到剪贴板"""
+        if hasattr(self.mqtt, 'device_sn') and self.mqtt.device_sn:
+            clipboard = QApplication.clipboard()
+            clipboard.setText(self.mqtt.device_sn)
+            
+            # 提示用户已复制
+            self.status_message_label.setText(f"已复制 SN: {self.mqtt.device_sn}")
+            
+            # 可选：短暂显示提示后恢复
+            QTimer.singleShot(3000, lambda: self.status_message_label.setText(""))
+            
+            QMessageBox.information(self, "复制成功", f"设备 SN 已复制到剪贴板：\n{self.mqtt.device_sn}")
+        else:
+            QMessageBox.warning(self, "提示", "当前没有可用的设备 SN")
+
+    def convert_modbus_value(self, value, data_type: str):
+        """根据 data_type 转换 Modbus 返回值"""
+        if not value:
+            return None
+            
+        try:
+            if data_type == "uint16":
+                return int(value[0]) if isinstance(value, list) else int(value)
+            elif data_type == "int16":
+                raw = int(value[0]) if isinstance(value, list) else int(value)
+                return raw if raw < 32768 else raw - 65536
+            elif data_type == "uint32":
+                # 假设返回的是两个寄存器
+                if isinstance(value, list) and len(value) >= 2:
+                    return (value[0] << 16) | value[1]
+                return int(value)
+            elif data_type == "float":
+                # 需要根据你的 Modbus 客户端实际返回格式调整
+                return float(value[0]) if isinstance(value, list) else float(value)
+            else:
+                return value
+        except:
+            return value
+        
+    def update_realtime_display(self, data_dict: dict):
+        """更新实时数据 LED 显示"""
+        # 清空旧的显示
+        while self.realtime_display.count():
+            child = self.realtime_display.takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
+
+        if not data_dict:
+            no_data = QLabel("暂无数据")
+            no_data.setStyleSheet("color: #888; font-size: 14px;")
+            self.realtime_display.addWidget(no_data)
+            return
+
+        for tag, value in data_dict.items():
+            h_layout = QHBoxLayout()
+            
+            # Tag 名称
+            tag_label = QLabel(f"{tag}:")
+            tag_label.setStyleSheet("color: #aaaaaa; font-size: 14px; min-width: 180px;")
+            
+            # 值（LED 风格）
+            value_str = str(value['value'])
+            value_label = QLabel(value_str)
+            value_label.setStyleSheet("""
+                QLabel {
+                    background-color: #003300;
+                    color: #00ff88;
+                    font-size: 16px;
+                    font-weight: bold;
+                    padding: 6px 12px;
+                    border: 2px solid #00cc66;
+                    border-radius: 6px;
+                    min-width: 120px;
+                }
+            """)
+            
+            h_layout.addWidget(tag_label)
+            h_layout.addWidget(value_label)
+            h_layout.addStretch()
+            
+            container = QWidget()
+            container.setLayout(h_layout)
+            self.realtime_display.addWidget(container)
+            
+    def closeEvent(self, event):
+        """窗口关闭时保存配置"""
+        self.save_mqtt_settings()
+        self.save_current_cfg()
+        event.accept()

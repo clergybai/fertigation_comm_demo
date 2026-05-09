@@ -252,6 +252,38 @@ class ModbusRTUClient:
                 return raw_value
 
         return raw_value
+    
+    def read_data_with_slave(self, 
+                             add: int, 
+                             count: int, 
+                             slave_id: int,
+                             converter: Callable[[int], T] | None = None, 
+                             little_endian: bool = True) -> Optional[Any]:
+        """
+        新增方法：支持指定 slave_id 的 Modbus 读取
+        （不改变原有 read_data 方法）
+        """
+        if not self.connected:
+            if not self.connect():
+                logger.warning(f"Cannot connect to read slave {slave_id}")
+                return None
+
+        # 临时修改 slave_id
+        original_slave_id = self.slave_id
+        self.slave_id = slave_id
+
+        try:
+            # 调用原有 read_data 方法（不改变它）
+            result = self.read_data(
+                add=add,
+                count=count,
+                converter=converter,
+                little_endian=little_endian
+            )
+            return result
+        finally:
+            # 恢复原来的 slave_id，避免影响其他地方
+            self.slave_id = original_slave_id
 
     def read_slave_id(self, add: int, count: int = 1) -> Optional[int]:
         """读取 Slave ID"""
