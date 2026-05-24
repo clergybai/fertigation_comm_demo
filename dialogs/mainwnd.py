@@ -1,7 +1,8 @@
 import time
 import json
 
-from PyQt5.QtWidgets import QAction, QApplication, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QMainWindow, QMenu, QMessageBox, QPushButton, QSpinBox, QStatusBar, QVBoxLayout, QWidget, QLineEdit
+from PyQt5 import QtWidgets
+from PyQt5.QtWidgets import QAction, QApplication, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QMainWindow, QMenu, QMessageBox, QPushButton, QScrollArea, QSpinBox, QStatusBar, QVBoxLayout, QWidget, QLineEdit
 from modbus.modbus_rtu import AsyncModbusRTUClient, ModbusRTUClient
 from PyQt5.QtCore import QTimer, Qt
 import serial.tools.list_ports
@@ -12,6 +13,8 @@ from widgets.spinbox import SlaveIdSpinBox
 from common.mqtt import MqttClient
 from PyQt5.QtCore import QSettings
 import os
+
+from widgets.toggle_button import ToggleToolButton
 
 
 class MainWindow(QMainWindow):
@@ -36,6 +39,7 @@ class MainWindow(QMainWindow):
         self.read_timer.timeout.connect(self.read_modbus_by_cfg)
         self.current_output = None
         self.pause_mqtt_publish = False
+        self.relay_status = [False] * 8
         
         self.initUI()
         # 程序启动后立即加载上次的配置
@@ -50,6 +54,7 @@ class MainWindow(QMainWindow):
         self.create_serial_panel()
         self.create_input_panel()
         self.create_output_panel()
+        self.create_relay_panel()
         self.create_realtime_data_panel()
         self.create_status_bar()
         self.create_mqtt_panel()
@@ -115,6 +120,10 @@ class MainWindow(QMainWindow):
         convert_title: QLabel = QLabel("Convert:")
         self.convert_combo: ConverterComboBox = ConverterComboBox()
         
+        self.read_id_btn: QPushButton = QPushButton("Read Device Slave ID")
+        self.read_id_btn.setStyleSheet("background-color: #0066cc; color: white; font-weight: bold;")
+        self.read_id_btn.clicked.connect(self.read_slave_id)
+        
         dara_read_btn: QPushButton = QPushButton("Read Registers")
         dara_read_btn.clicked.connect(self.read_registers)  # 连接读取寄存器的槽函数
         
@@ -131,6 +140,7 @@ class MainWindow(QMainWindow):
         h_layout.addWidget(convert_title)
         h_layout.addWidget(self.convert_combo)
         h_layout.addWidget(dara_read_btn)
+        h_layout.addWidget(self.read_id_btn)
         self.main_layout.addLayout(h_layout)
     
     def create_output_panel(self):
@@ -143,6 +153,94 @@ class MainWindow(QMainWindow):
         v_layout.addWidget(self.result_label)
         self.main_layout.addLayout(v_layout)
     
+    def create_relay_panel(self):
+        """485 继电器控制面板 - 高度固定不变"""
+        group = QFrame()
+        group.setFrameShape(QFrame.StyledPanel)
+        group.setStyleSheet("""
+            QFrame {
+                background-color: #f8f9fa;
+                border: 1px solid #cccccc;
+                border-radius: 6px;
+            }
+        """)
+        group.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed)
+        group.setFixedHeight(200)
+
+        layout = QVBoxLayout(group)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+        
+        title = QLabel("485 Relay Control")
+        title.setStyleSheet("font-weight: bold; font-size: 25px; color: #0066cc;")
+        title.setFixedHeight(30)
+        layout.addWidget(title)
+
+        # 第一行：所有控制控件
+        control_layout = QHBoxLayout()
+        
+        # 通道
+        channel_label = QLabel("Channel:")
+        # channel_label.setFixedWidth(45)
+        self.relay_channel_spin = QSpinBox()
+        self.relay_channel_spin.setRange(0, 7)
+        self.relay_channel_spin.setValue(0)
+        # self.relay_channel_spin.setFixedWidth(70)
+
+        control_layout.addWidget(channel_label)
+        control_layout.addWidget(self.relay_channel_spin)
+        control_layout.addSpacing(15)
+
+        # 控制按钮
+        for text, slot in [
+            ("ON", self.relay_turn_on),
+            ("OFF", self.relay_turn_off),
+            ("Toggle", self.relay_toggle),
+            ("Flash 800ms", self.relay_flash),
+            ("读取状态", self.read_coils_status)
+        ]:
+            btn = QPushButton(text)
+            # btn.setFixedWidth(105)
+            btn.clicked.connect(slot)
+            control_layout.addWidget(btn)
+
+        control_layout.addSpacing(20)
+
+        # 读取数量
+        read_label = QLabel("Read Coil Number:")
+        # read_label.setFixedWidth(70)
+        self.coil_count_spin = QSpinBox()
+        self.coil_count_spin.setRange(1, 16)
+        self.coil_count_spin.setValue(8)
+        # self.coil_count_spin.setFixedWidth(70)
+
+        self.read_coils_btn = QPushButton("Read All Coils")
+        self.read_coils_btn.clicked.connect(self.read_coils_status)
+
+        control_layout.addWidget(read_label)
+        control_layout.addWidget(self.coil_count_spin)
+        control_layout.addWidget(self.read_coils_btn)
+        control_layout.addStretch(1)
+
+        layout.addLayout(control_layout)
+
+        # ==================== Toggle 显示区域 - 固定高度 ====================
+        self.coils_status_layout = QHBoxLayout()
+        self.coils_status_layout.setSpacing(12)
+
+        # 使用固定高度的容器
+        toggle_container = QWidget()
+        toggle_container.setFixedHeight(110)           # ← 固定高度
+        toggle_container.setLayout(self.coils_status_layout)
+        
+        layout.addWidget(toggle_container)
+        # =====================================================================
+
+        self.main_layout.addWidget(group)
+
+        # 初始化显示
+        self.update_coils_display()
+    
     def create_realtime_data_panel(self):
         """创建实时数据 LED 显示面板"""
         group = QFrame()
@@ -151,8 +249,8 @@ class MainWindow(QMainWindow):
         
         layout = QVBoxLayout(group)
         
-        title = QLabel("实时数据 (Real-time Data)")
-        title.setStyleSheet("font-weight: bold; font-size: 15px; color: #00ffcc; padding: 5px;")
+        title = QLabel("Real-time Data")
+        title.setStyleSheet("font-weight: bold; font-size: 25px; color: #00ffcc; padding: 5px;")
         layout.addWidget(title)
 
         # 用于显示数据的容器
@@ -478,6 +576,35 @@ class MainWindow(QMainWindow):
         # self.result_label.setText(display_text)
         # --- 修改结束 ---
 
+    def read_slave_id(self):
+        """读取485设备的 Slave ID（使用广播指令）"""
+        if not self.client or not self.client.connected:
+            QMessageBox.warning(self, "Warning", "Please open the serial port first!")
+            return
+
+        self.status_message_label.setText("Broadcasting to read device ID...")
+
+        try:
+            slave_id = self.client.read_device_id_broadcast()   # 使用新方法
+            
+            if slave_id is not None:
+                self.status_message_label.setText(f"✅ Read successful! Device Slave ID = {slave_id}")
+                self.slave_id_spinbox.setValue(slave_id)   # 自动填充
+                QMessageBox.information(self, "Success", 
+                    f"Successfully read device address via broadcast \n\nSlave ID = {slave_id}")
+            else:
+                self.status_message_label.setText("❌ No device response received")
+                QMessageBox.warning(self, "Read failed", 
+                    "Broadcast read received no response.\n\nPossible reasons:\n"
+                    "1. The 485 wiring is incorrect (A/B wires are reversed).\n"
+                    "2. The device is not powered on.\n"
+                    "3. Baud rate/parity setting error\n"
+                    "4. The device does not support broadcasting (in rare cases).")
+                
+        except Exception as e:
+            self.status_message_label.setText(f"Exception: {e}")
+            QMessageBox.critical(self, "Error", f"Read failed:\n{str(e)}")
+
     def update_endian_enabled(self):
         """当 Count >= 2 时启用 Endian ComboBox，否则禁用"""
         count = self.reg_count_input.value()
@@ -489,6 +616,86 @@ class MainWindow(QMainWindow):
             self.little_endian_combo.setStyleSheet("QComboBox { color: gray; }")
         else:
             self.little_endian_combo.setStyleSheet("")
+
+    def update_coils_display(self):
+        """动态更新线圈状态显示 - 修复显示不全问题"""
+        # 清空旧的显示
+        while self.coils_status_layout.count():
+            child = self.coils_status_layout.takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
+
+        count = self.coil_count_spin.value()
+        
+        for i in range(count):
+            container = QWidget()
+            vbox = QVBoxLayout(container)
+            vbox.setContentsMargins(8, 8, 8, 8)   # 增加四周内边距
+            vbox.setSpacing(5)
+            
+            # 通道标签
+            label = QLabel(f"CH{i}")
+            label.setAlignment(Qt.AlignCenter)
+            label.setFixedHeight(22)
+            label.setStyleSheet("font-size: 20px; font-weight: bold;")
+            
+            # Toggle 开关 - 增大尺寸
+            toggle = ToggleToolButton()
+            toggle.setChecked(self.relay_status[i] if i < len(self.relay_status) else False)
+            # toggle.setFixedSize(68, 36)           # ← 增大 Toggle 宽度和高度
+            toggle.setFixedSize(85, 48)
+            toggle.toggled.connect(lambda checked, ch=i: self.on_coil_toggle(ch, checked))
+            
+            vbox.addWidget(label)
+            vbox.addWidget(toggle)
+            vbox.addStretch(1)
+            
+            # 关键修复：给每个通道容器足够的最小宽度
+            container.setMinimumWidth(110)         # ← 增加最小宽度
+            
+            self.coils_status_layout.addWidget(container)
+        
+        # 添加弹性空间
+        self.coils_status_layout.addStretch(1)
+
+    def on_coil_toggle(self, channel: int, checked: bool):
+        """点击 Toggle 直接控制对应线圈"""
+        if not self.client or not self.client.connected:
+            QMessageBox.warning(self, "警告", "串口未打开")
+            return
+            
+        success = self.client.write_single_coil(channel, checked)
+        if success:
+            self.relay_status[channel] = checked
+            self.status_message_label.setText(f"CH{channel} 已设置为 {'ON' if checked else 'OFF'}")
+        else:
+            QMessageBox.warning(self, "失败", f"控制 CH{channel} 失败")
+
+    def read_coils_status(self):
+        """读取线圈输出状态 (功能码 01)"""
+        if not self.client or not self.client.connected:
+            QMessageBox.warning(self, "Warning", "Please open the serial port first!")
+            return
+
+        count = self.coil_count_spin.value()
+        self.status_message_label.setText(f"Reading the states of the first {count} coils...")
+
+        try:
+            # 功能码 01：读取线圈状态
+            response = self.client.read_coils(start_addr=0, count=count)
+            
+            if response is not None:
+                self.relay_status = response[:count]  # 更新缓存
+                self.update_coils_display()
+                status_text = " | ".join([f"CH{i}:{'ON' if s else 'OFF'}" for i, s in enumerate(self.relay_status)])
+                self.status_message_label.setText(f"Read successful: {status_text}")
+            else:
+                self.status_message_label.setText("Failed to read coil status")
+                QMessageBox.warning(self, "Fail", "No device response received")
+                
+        except Exception as e:
+            self.status_message_label.setText(f"读取异常: {e}")
+            QMessageBox.critical(self, "错误", str(e))
 
     def browse_ca_file(self):
         file_path, _ = QFileDialog.getOpenFileName(self, "Select CA Certificate", "", "Certificate Files (*.crt *.pem);;All Files (*)")
@@ -812,3 +1019,64 @@ class MainWindow(QMainWindow):
         self.save_mqtt_settings()
         self.save_current_cfg()
         event.accept()
+
+    def relay_turn_on(self):
+        """打开指定继电器通道"""
+        if not self._check_client_ready():
+            return
+        ch = self.relay_channel_spin.value()
+        success = self.client.write_single_coil(ch, True)
+        if success:
+            self.relay_status[ch] = True
+            self.status_message_label.setText(f"继电器 CH{ch} 已打开 (ON)")
+            self.update_coils_display()   # 刷新显示
+        else:
+            QMessageBox.warning(self, "失败", f"打开继电器 CH{ch} 失败")
+
+    def relay_turn_off(self):
+        """关闭指定继电器通道"""
+        if not self._check_client_ready():
+            return
+        ch = self.relay_channel_spin.value()
+        success = self.client.write_single_coil(ch, False)
+        if success:
+            self.relay_status[ch] = False
+            self.status_message_label.setText(f"继电器 CH{ch} 已关闭 (OFF)")
+            self.update_coils_display()
+        else:
+            QMessageBox.warning(self, "失败", f"关闭继电器 CH{ch} 失败")
+
+    def relay_toggle(self):
+        """翻转指定继电器通道"""
+        if not self._check_client_ready():
+            return
+        ch = self.relay_channel_spin.value()
+        # 当前状态取反
+        new_state = not self.relay_status[ch] if ch < len(self.relay_status) else True
+        success = self.client.write_single_coil(ch, new_state)
+        if success:
+            self.relay_status[ch] = new_state
+            self.status_message_label.setText(f"继电器 CH{ch} 已翻转 → {'ON' if new_state else 'OFF'}")
+            self.update_coils_display()
+        else:
+            QMessageBox.warning(self, "失败", f"翻转继电器 CH{ch} 失败")
+
+    def relay_flash(self):
+        """闪开（延时断开）800ms"""
+        if not self._check_client_ready():
+            return
+        ch = self.relay_channel_spin.value()
+        # 根据你提供的指令表，使用功能码05 + 特定值实现闪开
+        success = self.client.flash_coil(ch, delay_ms=800)
+        if success:
+            self.status_message_label.setText(f"继电器 CH{ch} 已触发闪开 800ms")
+            QTimer.singleShot(1200, self.read_coils_status)
+        else:
+            QMessageBox.warning(self, "失败", f"闪开命令发送失败")
+
+    def _check_client_ready(self):
+        """检查串口是否准备好"""
+        if not self.client or not self.client.connected:
+            QMessageBox.warning(self, "警告", "请先打开串口！")
+            return False
+        return True
