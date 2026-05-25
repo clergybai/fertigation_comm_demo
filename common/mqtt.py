@@ -71,6 +71,7 @@ class MqttClient(QObject):
             self.connected.emit()
             self._generate_device_sn()
             self.subscribe_config_topic()
+            self.subscribe_action_topic()
             print("Connected to MQTT Broker!")
         else:
             self.connection_error.emit(f"连接失败，错误码: {rc}")
@@ -150,6 +151,25 @@ class MqttClient(QObject):
 
         topic = f"tenants/{self.tenant_id}/devices/{self.device_sn}/cfg"
         
+        try:
+            if self._client and self._client.is_connected():
+                self._client.subscribe(topic, qos=1)   # 使用 QoS 1 更可靠
+                self.subscribed.emit(topic)
+                print(f"已订阅配置主题: {topic}")
+            else:
+                print("MQTT Client 未连接，无法订阅")
+        except Exception as e:
+            print(f"订阅失败: {e}")
+            
+    def subscribe_action_topic(self):
+        """订阅 tenants/{tenant_id}/devices/{sn}/action 主题"""
+        if not self.tenant_id:
+            print("Warning: Tenant ID 为空，跳过订阅")
+            return
+        if not self.device_sn:
+            print("Warning: Device SN 还未生成，跳过订阅")
+            return
+        topic = f"tenants/{self.tenant_id}/devices/{self.device_sn}/action"
         try:
             if self._client and self._client.is_connected():
                 self._client.subscribe(topic, qos=1)   # 使用 QoS 1 更可靠

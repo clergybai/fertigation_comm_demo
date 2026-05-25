@@ -2,12 +2,13 @@ import time
 import json
 
 from PyQt5 import QtWidgets
-from PyQt5.QtWidgets import QAction, QApplication, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QMainWindow, QMenu, QMessageBox, QPushButton, QScrollArea, QSpinBox, QStatusBar, QVBoxLayout, QWidget, QLineEdit
+from PyQt5.QtWidgets import QAction, QApplication, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QMainWindow, QMenu, QMessageBox, QPushButton, QScrollArea, QSpinBox, QStatusBar, QTextEdit, QVBoxLayout, QWidget, QLineEdit
 from modbus.modbus_rtu import AsyncModbusRTUClient, ModbusRTUClient
 from PyQt5.QtCore import QTimer, Qt
 import serial.tools.list_ports
 from widgets.combobox import BaudrateComboBox, ConverterComboBox, DataBitsComboBox, ParityComboBox, StopBitsComboBox
 from common.const import WITHOUT_SERIAL, CONFIG_FILE
+from common.utils.modbus_logger import modbus_notifier
 from widgets.lineedit import HexAddressInput
 from widgets.spinbox import SlaveIdSpinBox
 from common.mqtt import MqttClient
@@ -22,7 +23,6 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super(MainWindow, self).__init__()
         self.setWindowTitle("Modbus RTU Client Tool")
-        
         # 初始化 QSettings（推荐使用组织名 + 应用名）
         self.settings = QSettings("Kunlunbot", "ModbusRTUClientTool")
         
@@ -40,11 +40,13 @@ class MainWindow(QMainWindow):
         self.current_output = None
         self.pause_mqtt_publish = False
         self.relay_status = [False] * 8
+        self.log_text = None
+        self.is_controlling_now = False
         
         self.initUI()
         # 程序启动后立即加载上次的配置
         self.load_mqtt_settings()
-        self.load_current_cfg() 
+        self.load_current_cfg()
         
     def initUI(self):
         self.setGeometry(100, 100, 1024, 768)
@@ -58,6 +60,7 @@ class MainWindow(QMainWindow):
         self.create_realtime_data_panel()
         self.create_status_bar()
         self.create_mqtt_panel()
+        self.create_log_panel()
         
     def create_serial_panel(self):
         title = QLabel("Select a serial")
@@ -130,6 +133,25 @@ class MainWindow(QMainWindow):
         self.update_endian_enabled()
         self.reg_count_input.valueChanged.connect(self.update_endian_enabled)
         
+        new_id_title = QLabel("New Slave ID:")
+        self.new_slave_id_input = QSpinBox()
+        self.new_slave_id_input.setRange(1, 255)
+        self.new_slave_id_input.setValue(2)
+        self.new_slave_id_input.setFixedWidth(65)
+        
+        self.change_id_btn = QPushButton("Change Slave Id")
+        self.change_id_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #ff9900; 
+                color: white; 
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #e68a00;
+            }
+        """)
+        self.change_id_btn.clicked.connect(self.change_device_slave_id)
+        
         h_layout = QHBoxLayout()
         h_layout.addWidget(addr_title)
         h_layout.addWidget(self.reg_addr_input)
@@ -141,6 +163,12 @@ class MainWindow(QMainWindow):
         h_layout.addWidget(self.convert_combo)
         h_layout.addWidget(dara_read_btn)
         h_layout.addWidget(self.read_id_btn)
+        h_layout.addSpacing(15)  # 在读取和修改之间加个小间距，防止误触
+        h_layout.addWidget(new_id_title)
+        h_layout.addWidget(self.new_slave_id_input)
+        h_layout.addWidget(self.change_id_btn)
+        
+        h_layout.addStretch(1)
         self.main_layout.addLayout(h_layout)
     
     def create_output_panel(self):
@@ -192,18 +220,32 @@ class MainWindow(QMainWindow):
         control_layout.addSpacing(15)
 
         # 控制按钮
-        for text, slot in [
-            ("ON", self.relay_turn_on),
-            ("OFF", self.relay_turn_off),
-            ("Toggle", self.relay_toggle),
-            ("Flash 800ms", self.relay_flash),
-            ("读取状态", self.read_coils_status)
-        ]:
-            btn = QPushButton(text)
-            # btn.setFixedWidth(105)
-            btn.clicked.connect(slot)
-            control_layout.addWidget(btn)
+        self.relay_on_btn = QPushButton("ON")
+        self.relay_off_btn = QPushButton("OFF")
+        self.relay_toggle_btn = QPushButton("Toggle")
+        self.relay_flash_btn = QPushButton("Flash")
+        self.relay_read_btn = QPushButton("读取状态")
 
+        self.relay_on_btn.clicked.connect(self.relay_turn_on)
+        self.relay_off_btn.clicked.connect(self.relay_turn_off)
+        self.relay_toggle_btn.clicked.connect(self.relay_toggle)
+        self.relay_flash_btn.clicked.connect(self.relay_flash)
+        self.relay_read_btn.clicked.connect(self.read_coils_status)
+
+        for btn in [self.relay_on_btn, self.relay_off_btn, self.relay_toggle_btn, self.relay_read_btn]:
+            btn.setFixedWidth(90)
+            control_layout.addWidget(btn)
+        
+        # Flash 延时输入框
+        self.flash_delay_spin = QSpinBox()
+        self.flash_delay_spin.setRange(100, 5000)
+        self.flash_delay_spin.setValue(800)
+        self.flash_delay_spin.setSingleStep(100)
+        self.flash_delay_spin.setSuffix(" ms")
+        self.flash_delay_spin.setFixedWidth(110)
+
+        control_layout.addWidget(self.relay_flash_btn)
+        control_layout.addWidget(self.flash_delay_spin)
         control_layout.addSpacing(20)
 
         # 读取数量
@@ -315,7 +357,7 @@ class MainWindow(QMainWindow):
         group.setFrameShape(QFrame.StyledPanel)
         layout = QVBoxLayout(group)
 
-        title = QLabel("MQTT Broker 配置")
+        title = QLabel("MQTT Broker Configuration")
         title.setStyleSheet("font-weight: bold; font-size: 14px;")
 
         # Broker 地址
@@ -339,7 +381,7 @@ class MainWindow(QMainWindow):
         config_layout.addSpacing(20)
         config_layout.addWidget(QLabel("Tenant ID:"))
         self.mqtt_tenant_id_input = QLineEdit()
-        self.mqtt_tenant_id_input.setPlaceholderText("输入 Tenant ID")
+        self.mqtt_tenant_id_input.setPlaceholderText("Input Tenant ID")
         self.mqtt_tenant_id_input.setMinimumWidth(150)
         config_layout.addWidget(self.mqtt_tenant_id_input)
 
@@ -381,9 +423,9 @@ class MainWindow(QMainWindow):
 
         # 连接按钮
         btn_layout = QHBoxLayout()
-        self.mqtt_connect_btn = QPushButton("连接 MQTT")
+        self.mqtt_connect_btn = QPushButton("Connect MQTT")
         self.mqtt_connect_btn.clicked.connect(self.connect_mqtt)
-        self.mqtt_disconnect_btn = QPushButton("断开 MQTT")
+        self.mqtt_disconnect_btn = QPushButton("Disconnect MQTT")
         self.mqtt_disconnect_btn.clicked.connect(self.disconnect_mqtt)
         self.pause_mqtt_publish_btn = QPushButton("Pause MQTT Publish")
         self.pause_mqtt_publish_btn.clicked.connect(self.toggle_mqtt_publish)
@@ -404,7 +446,48 @@ class MainWindow(QMainWindow):
         self.main_layout.addWidget(group)
         
         self.mqtt.device_sn_generated.connect(self.on_device_sn_generated) 
+
+    def create_log_panel(self):
+        """新增 Modbus 通信日志面板"""
+        group = QFrame()
+        group.setFrameShape(QFrame.StyledPanel)
+        group.setStyleSheet("""
+            QFrame {
+                background-color: #f8f9fa;
+                border: 1px solid #cccccc;
+                border-radius: 6px;
+            }
+        """)
+
+        layout = QVBoxLayout(group)
         
+        title = QLabel("Modbus Communication Log")
+        title.setStyleSheet("font-weight: bold; font-size: 24px; color: #0066cc; padding: 5px;")
+        layout.addWidget(title)
+
+        # 日志显示区域
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        self.log_text.setMinimumHeight(180)
+        self.log_text.setStyleSheet("""
+            QTextEdit {
+                background-color: #1e1e1e;
+                color: #00ff88;
+                font-family: Consolas, Courier New, monospace;
+                font-size: 22px;
+                border: 1px solid #444;
+            }
+        """)
+        
+        layout.addWidget(self.log_text)
+        
+        # 清除日志按钮
+        clear_btn = QPushButton("Clear Log")
+        clear_btn.clicked.connect(self.clear_log)
+        layout.addWidget(clear_btn)
+
+        self.main_layout.addWidget(group, stretch=1)
+    
     def save_mqtt_settings(self):
         """保存 MQTT 配置到本地文件"""
         self.settings.setValue("mqtt/broker", self.mqtt_broker_input.text().strip())
@@ -522,7 +605,8 @@ class MainWindow(QMainWindow):
                 bytesize=self.databits_combo.get_current_data_bits(),
                 stopbits=self.stopbits_combo.get_current_stop_bits(),
                 slave_id=self.slave_id_spinbox.get_slave_id(),
-                timeout=1)
+                timeout=1,
+                main_window=self)
             if self.client.connect():
                 self.confirm_btn.setText("Close Serial Port")
                 self.status_message_label.setText(f"串口 {self.selected_port} 已打开")
@@ -604,6 +688,49 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self.status_message_label.setText(f"Exception: {e}")
             QMessageBox.critical(self, "Error", f"Read failed:\n{str(e)}")
+    
+    def change_device_slave_id(self):
+        """
+        槽函数：响应界面按钮，调用底层广播修改 ID
+        """
+        if not self.client or not self.client.connected:
+            QMessageBox.warning(self, "Warning", "Please open the serial port first!")
+            return
+
+        target_new_id = self.new_slave_id_input.value()
+
+        # 强力安全弹窗提示
+        confirm_msg = (
+            f"⚠️ 行业铁律提示：您正在使用【广播模式】修改地址！\n\n"
+            f"即将把总线上的设备地址强制变更为: {target_new_id}\n\n"
+            f"请100%确保当前 485 总线上【只接了一个传感器】！\n"
+            f"如果接了多个设备，它们会【全部】变成新地址 {target_new_id}。"
+        )
+        reply = QMessageBox.question(self, "广播修改设备地址确认", confirm_msg, 
+                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply == QMessageBox.No:
+            return
+
+        self.status_message_label.setText(f"正在广播写入新地址 {target_new_id} ...")
+
+        # 🌟 核心优雅调用：一行代码搞定底层通信
+        success = self.client.write_slave_id_broadcast(target_new_id)
+
+        if success:
+            self.status_message_label.setText(f"✅ 广播修改指令发送完毕！新地址：{target_new_id}")
+            
+            # 联动：自动把主界面的下拉框/输入框切到新 ID，方便用户直接点击“读取”测试
+            self.slave_id_spinbox.setValue(target_new_id) 
+            
+            QMessageBox.information(
+                self, "Broadcast Success", 
+                f"广播改写指令已成功下发！\n\n"
+                f"设备新地址已预设为: {target_new_id}\n"
+                f"日常通信 [Slave ID] 已自动切换，您可以直接读取寄存器验证。"
+            )
+        else:
+            self.status_message_label.setText("❌ 广播修改失败")
+            QMessageBox.critical(self, "Error", "广播修改指令下发异常，请查看控制台日志。")
 
     def update_endian_enabled(self):
         """当 Count >= 2 时启用 Endian ComboBox，否则禁用"""
@@ -630,19 +757,22 @@ class MainWindow(QMainWindow):
         for i in range(count):
             container = QWidget()
             vbox = QVBoxLayout(container)
-            vbox.setContentsMargins(8, 8, 8, 8)   # 增加四周内边距
+            vbox.setContentsMargins(8, 8, 8, 8)
             vbox.setSpacing(5)
             
-            # 通道标签
             label = QLabel(f"CH{i}")
             label.setAlignment(Qt.AlignCenter)
             label.setFixedHeight(22)
             label.setStyleSheet("font-size: 20px; font-weight: bold;")
             
-            # Toggle 开关 - 增大尺寸
             toggle = ToggleToolButton()
+            
+            # ================= 🛠️ 核心修复：在这里加锁 =================
+            toggle.blockSignals(True)  # 1. 临时屏蔽信号，防止 setChecked 触发 toggled 信号
             toggle.setChecked(self.relay_status[i] if i < len(self.relay_status) else False)
-            # toggle.setFixedSize(68, 36)           # ← 增大 Toggle 宽度和高度
+            toggle.blockSignals(False) # 2. 状态赋值完毕，重新放开信号
+            # =========================================================
+            
             toggle.setFixedSize(85, 48)
             toggle.toggled.connect(lambda checked, ch=i: self.on_coil_toggle(ch, checked))
             
@@ -650,12 +780,9 @@ class MainWindow(QMainWindow):
             vbox.addWidget(toggle)
             vbox.addStretch(1)
             
-            # 关键修复：给每个通道容器足够的最小宽度
-            container.setMinimumWidth(110)         # ← 增加最小宽度
-            
+            container.setMinimumWidth(110)
             self.coils_status_layout.addWidget(container)
         
-        # 添加弹性空间
         self.coils_status_layout.addStretch(1)
 
     def on_coil_toggle(self, channel: int, checked: bool):
@@ -719,7 +846,7 @@ class MainWindow(QMainWindow):
         
         self.mqtt.username = username if username else None
         self.mqtt.password = password if password else None
-        self.status_message_label.setText("正在连接 MQTT Broker...")
+        self.status_message_label.setText("Connecting MQTT Broker...")
         
         self.mqtt.broker = self.mqtt_broker_input.text().strip()
         self.mqtt.port = self.mqtt_port_input.value()
@@ -811,31 +938,38 @@ class MainWindow(QMainWindow):
         # 这里可以把收到的消息显示在界面上（你目前没有输出面板，可以自行添加 QTextEdit）
         try:
             data = json.loads(payload)
-            if "cfg" in data and isinstance(data.get("cfg"), list):
-                self.current_cfg = data["cfg"]
-                new_freq = data.get("freq", 300)
-                
-                # 更新内部变量
-                self.freq_seconds = new_freq
-                
-                # === 关键：同步更新界面上的频率输入框 ===
-                try:
-                    # 临时断开信号，避免触发 on_freq_changed 导致重复启动
-                    self.freq_input.valueChanged.disconnect(self.on_freq_changed)
-                    self.freq_input.setValue(new_freq)
-                    self.freq_input.valueChanged.connect(self.on_freq_changed)
-                except:
-                    # 如果信号未连接，直接设置值
-                    self.freq_input.setValue(new_freq)
-                
-                
-                self.status_message_label.setText(f"Receive cfg update | Frequency: {self.freq_seconds}s | tag number: {len(self.current_cfg)}")
-                
-                self.read_timer.stop()
-                if self.freq_seconds > 0:
-                    self.read_timer.start(self.freq_seconds * 1000)
-                
-                self.save_current_cfg()
+            topic_parts = topic.split('/')
+            topic_postfix = topic_parts[len(topic_parts)-1]
+            
+            if topic_postfix == "cfg":
+                if "cfg" in data and isinstance(data.get("cfg"), list):
+                    self.current_cfg = data["cfg"]
+                    new_freq = data.get("freq", 300)
+                    
+                    # 更新内部变量
+                    self.freq_seconds = new_freq
+                    
+                    # === 关键：同步更新界面上的频率输入框 ===
+                    try:
+                        # 临时断开信号，避免触发 on_freq_changed 导致重复启动
+                        self.freq_input.valueChanged.disconnect(self.on_freq_changed)
+                        self.freq_input.setValue(new_freq)
+                        self.freq_input.valueChanged.connect(self.on_freq_changed)
+                    except:
+                        # 如果信号未连接，直接设置值
+                        self.freq_input.setValue(new_freq)
+                    
+                    
+                    self.status_message_label.setText(f"Receive cfg update | Frequency: {self.freq_seconds}s | tag number: {len(self.current_cfg)}")
+                    
+                    self.read_timer.stop()
+                    if self.freq_seconds > 0:
+                        self.read_timer.start(self.freq_seconds * 1000)
+                    
+                    self.save_current_cfg()
+            elif topic_postfix == "action":
+                # TODO handel relay action
+                pass
         except json.JSONDecodeError:
             print(f"Received non-JSON MQTT message on topic {topic}: {payload}")
         except Exception as e:
@@ -921,12 +1055,6 @@ class MainWindow(QMainWindow):
         copy_action = QAction("复制 SN", self)
         copy_action.triggered.connect(self.copy_sn_to_clipboard)
         menu.addAction(copy_action)
-
-        # 可选：添加分隔线和其他功能
-        # menu.addSeparator()
-        # menu.addAction("刷新 SN", self.refresh_sn)   # 如果以后需要
-
-        # 在鼠标位置显示菜单
         menu.exec_(self.sn_label.mapToGlobal(pos))
 
     def copy_sn_to_clipboard(self):
@@ -1062,17 +1190,72 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "失败", f"翻转继电器 CH{ch} 失败")
 
     def relay_flash(self):
-        """闪开（延时断开）800ms"""
+        """闪开（延时断开）"""
         if not self._check_client_ready():
             return
+            
         ch = self.relay_channel_spin.value()
-        # 根据你提供的指令表，使用功能码05 + 特定值实现闪开
-        success = self.client.flash_coil(ch, delay_ms=800)
+        delay_ms = self.flash_delay_spin.value()
+        
+        print(f"【调试】准备调用 flash_coil, CH={ch}, delay={delay_ms}ms")   # ← 加这行
+        
+        success = self.client.flash_coil(ch, delay_ms=delay_ms)
+        
         if success:
-            self.status_message_label.setText(f"继电器 CH{ch} 已触发闪开 800ms")
-            QTimer.singleShot(1200, self.read_coils_status)
+            self.status_message_label.setText(f"CH{ch} 已触发闪开 {delay_ms}ms")
+            QTimer.singleShot(delay_ms + 600, self.read_coils_status)
         else:
-            QMessageBox.warning(self, "失败", f"闪开命令发送失败")
+            QMessageBox.warning(self, "失败", f"闪开命令发送失败 (CH{ch} {delay_ms}ms)")
+
+
+    def append_log(self, direction: str, data: bytes):
+        """向日志区域添加收发报文"""
+        if not self.log_text:
+            return
+            
+        timestamp = time.strftime("%H:%M:%S")
+        hex_data = data.hex().upper()
+        
+        if direction == "TX":
+            color = "#00ccff"   # 发送用蓝色
+            text = f"[{timestamp}] TX → {hex_data}"
+        else:
+            color = "#00ff88"   # 接收用绿色
+            text = f"[{timestamp}] RX ← {hex_data}"
+        
+        self.log_text.append(f'<span style="color:{color}">{text}</span>')
+        
+        # 自动滚动到底部
+        self.log_text.verticalScrollBar().setValue(self.log_text.verticalScrollBar().maximum())
+        
+    def append_log_raw(self, text: str):
+        """添加原始串口报文或普通文本到日志"""
+        if not self.log_text:
+            return
+        
+        # if self.is_controlling_now and "01 01" in text:
+        #     return
+
+        # 1. 安全防护：限制最大行数（例如 500 行），防止密集串口数据导致界面卡死
+        if self.log_text.document().blockCount() > 500:
+            cursor = self.log_text.textCursor()
+            cursor.movePosition(cursor.Start)
+            cursor.select(cursor.LineUnderCursor)
+            cursor.removeSelectedText()
+            cursor.deleteChar()  # 删除换行符
+
+        # 2. 插入文本
+        self.log_text.append(text)
+        
+        # 3. 自动滚动到底部
+        scrollbar = self.log_text.verticalScrollBar()
+        if scrollbar:
+            scrollbar.setValue(scrollbar.maximum())
+
+    def clear_log(self):
+        """清除日志"""
+        if self.log_text:
+            self.log_text.clear()
 
     def _check_client_ready(self):
         """检查串口是否准备好"""
