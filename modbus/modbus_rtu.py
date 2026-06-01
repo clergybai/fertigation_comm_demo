@@ -488,16 +488,36 @@ class ModbusRTUClient:
             logger.error(f"广播读取设备ID异常: {e}")
             return None
 
-    def read_coils(self, start_addr=0, count=8):
+    def read_coils(self, start_addr=0, count=8, slave_id=None):
         """读取线圈状态 (功能码 01)"""
+        if slave_id is None:
+            slave_id = self.slave_id
         try:
-            response = self.client.read_coils(address=start_addr, count=count, device_id=self.slave_id)
+            response = self.client.read_coils(address=start_addr, count=count, device_id=slave_id)
             if response.isError():
                 logger.error(f"Read coils failed: {response}")
                 return None
             return response.bits   # 返回布尔列表
         except Exception as e:
             logger.error(f"read_coils error: {e}")
+            return None
+
+    def read_discrete_inputs(self, start_addr=0, count=8, slave_id=None):
+        """读取离散输入 (功能码 02) 这里面指的是读取IN1的寄存器状态"""
+        if slave_id is None:
+            slave_id = self.slave_id
+        try:
+            response = self.client.read_discrete_inputs(
+                address=start_addr, 
+                count=count, 
+                device_id=slave_id
+            )
+            if not response.isError():
+                return response.bits
+            else:
+                return None
+        except Exception as e:
+            logger.error(f"read_discrete_inputs error: {e}")
             return None
 
     def write_single_coil(self, address, value):
@@ -508,6 +528,23 @@ class ModbusRTUClient:
         except Exception as e:
             logger.error(f"write_single_coil error: {e}")
             return False
+        
+    def write_single_coil_with_slaveid(self, slave_id, address, value):
+        if not self.connected:
+            if not self.connect():
+                logger.warning(f"Cannot connect to read slave {slave_id}")
+                return None
+
+        # 临时修改 slave_id
+        original_slave_id = self.slave_id
+        self.slave_id = slave_id
+        
+        try:
+            self.write_single_coil(address, value)
+        finally:
+            # 恢复原来的 slave_id，避免影响其他地方
+            self.slave_id = original_slave_id
+            
     
     def write_slave_id_broadcast(self, new_slave_id: int) -> bool:
         """

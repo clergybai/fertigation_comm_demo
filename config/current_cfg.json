@@ -1,14 +1,13 @@
 {
-  "cfg": [
+  "cfg": [],
+  "freq": 10,
+  "actuator_cfg": [
     {
-      "id": "b1c2fa72-e79a-451b-9884-4ff3a4bb420e",
-      "tag_code": "air_temperature",
-      "slave_id": 1,
-      "reg_address": 1,
-      "count": 1,
-      "data_type": "uint16",
-      "scale": 0.1
+      "id": "1a99a80f-6e42-4a11-a6d7-6f6dadf47a3a",
+      "slave_id": 101,
+      "reg_address": 0,
+      "coil_count": 8
     }
   ],
-  "freq": 10
+  "actuator_freq": 1
 }

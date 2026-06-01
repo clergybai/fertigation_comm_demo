@@ -7,6 +7,7 @@ from modbus.modbus_rtu import AsyncModbusRTUClient, ModbusRTUClient
 from PyQt5.QtCore import QTimer, Qt
 import serial.tools.list_ports
 from widgets.combobox import BaudrateComboBox, ConverterComboBox, DataBitsComboBox, ParityComboBox, StopBitsComboBox
+from widgets.actuator_status_widget import ActuatorStatusWidget
 from common.const import WITHOUT_SERIAL, CONFIG_FILE
 from common.utils.modbus_logger import modbus_notifier
 from widgets.lineedit import HexAddressInput
@@ -35,8 +36,16 @@ class MainWindow(QMainWindow):
         
         self.current_cfg = []
         self.freq_seconds = 300
+        self.actuator_cfg = []
+        self.actuator_freq = 10
+        # last_actuator_states record last discrete status
+        self.last_actuator_states = {}
         self.read_timer = QTimer()
         self.read_timer.timeout.connect(self.read_modbus_by_cfg)
+        
+        self.actuator_read_timer = QTimer()
+        self.actuator_read_timer.timeout.connect(self.read_actuators_by_cfg)
+        
         self.current_output = None
         self.pause_mqtt_publish = False
         self.relay_status = [False] * 8
@@ -385,7 +394,7 @@ class MainWindow(QMainWindow):
         self.mqtt_tenant_id_input.setMinimumWidth(150)
         config_layout.addWidget(self.mqtt_tenant_id_input)
 
-        # 新增：读取频率
+        # 读取频率
         config_layout.addSpacing(30)
         config_layout.addWidget(QLabel("Read Freq (sec):"))
         self.freq_input = QSpinBox()
@@ -394,6 +403,16 @@ class MainWindow(QMainWindow):
         self.freq_input.setSingleStep(10)
         self.freq_input.valueChanged.connect(self.on_freq_changed)   # 实时响应修改
         config_layout.addWidget(self.freq_input)
+        
+        # 新增：Actuator Frequency
+        config_layout.addSpacing(20)
+        config_layout.addWidget(QLabel("Actuator Freq (sec):"))
+        self.actuator_freq_input = QSpinBox()
+        self.actuator_freq_input.setRange(1, 3600)
+        self.actuator_freq_input.setValue(300)
+        self.actuator_freq_input.setSingleStep(10)
+        self.actuator_freq_input.valueChanged.connect(self.on_actuator_freq_changed)
+        config_layout.addWidget(self.actuator_freq_input)
 
         # CA + Username + Password 放在同一行
         auth_layout = QHBoxLayout()
@@ -537,7 +556,9 @@ class MainWindow(QMainWindow):
             with open(self.config_file, 'w', encoding='utf-8') as f:
                 json.dump({
                     "cfg": self.current_cfg,
-                    "freq": self.freq_seconds
+                    "freq": self.freq_seconds,
+                    "actuator_cfg": self.actuator_cfg,
+                    "actuator_freq": self.actuator_freq
                 }, f, ensure_ascii=False, indent=2)
             print(f"Saved current cfg to {self.config_file}")
         except Exception as e:
@@ -552,10 +573,17 @@ class MainWindow(QMainWindow):
                 data = json.load(f)
             self.current_cfg = data.get("cfg", {})
             self.freq_seconds = data.get("freq", 300)
+            self.actuator_cfg = data.get("actuator_cfg", [])
+            self.actuator_freq = data.get("actuator_freq", 300)
             
-            self.freq_input.valueChanged.disconnect(self.on_freq_changed)
-            self.freq_input.setValue(self.freq_seconds)
-            self.freq_input.valueChanged.connect(self.on_freq_changed)  # 重新连接
+            try:
+                if hasattr(self, 'actuator_freq_input'):
+                    self.actuator_freq_input.setValue(self.actuator_freq)
+                self.freq_input.valueChanged.disconnect(self.on_freq_changed)
+                self.freq_input.setValue(self.freq_seconds)
+                self.freq_input.valueChanged.connect(self.on_freq_changed)
+            except:
+                self.freq_input.setValue(self.freq_seconds)
             
             if self.current_cfg:
                 self.status_message_label.setText(f"load cfg | {len(self.current_cfg)} tags | freq: {self.freq_seconds}s")
@@ -563,7 +591,9 @@ class MainWindow(QMainWindow):
         except Exception as e:
             print(f"加载 cfg 失败: {e}")
             self.current_cfg = []
+            self.actuator_cfg = []
             self.freq_seconds = 300
+            self.actuator_freq = 10
 
     def refresh_port(self):
         self.port_combo.clear()
@@ -863,6 +893,14 @@ class MainWindow(QMainWindow):
         self.mqtt.error_occurred.connect(self.on_mqtt_error)
         
         self.mqtt.connect_to_broker()
+        
+    def check_acutator_status_equal_by_ch(self, device_id, ch, val):
+        if not self.last_actuator_states:
+            return False
+        if device_id not in self.last_actuator_states:
+            return False
+        last_status_vals = self.last_actuator_states.get(device_id)
+        return val == last_status_vals[ch]
 
     def disconnect_mqtt(self):
         self.mqtt.disconnect()
@@ -904,6 +942,14 @@ class MainWindow(QMainWindow):
         
         # 保存到配置文件
         self.save_current_cfg()
+        
+    def on_actuator_freq_changed(self, new_freq: int):
+        """用户手动修改执行器频率时实时生效"""
+        self.actuator_freq = new_freq
+        self.status_message_label.setText(f"执行器频率已修改为: {new_freq} 秒")
+        
+        # 保存配置
+        self.save_current_cfg()
 
     # 信号槽
     def on_mqtt_connected(self):
@@ -922,6 +968,16 @@ class MainWindow(QMainWindow):
             self.status_message_label.setText(f"MQTT 已连接，开始周期读取（每 {self.freq_seconds} 秒）")
         else:
             self.status_message_label.setText("MQTT 已连接，等待串口打开或配置下发...")
+        
+        if (self.client and self.client.connected and 
+            self.actuator_cfg and len(self.actuator_cfg) > 0 and 
+            self.actuator_freq > 0):
+            if not hasattr(self, 'actuator_read_timer'):
+                self.actuator_read_timer = QTimer()
+                self.actuator_read_timer.timeout.connect(self.read_actuators_by_cfg)
+            self.actuator_read_timer.stop()
+            if self.actuator_freq > 0:
+                self.actuator_read_timer.start(self.actuator_freq * 1000)
 
     def on_mqtt_disconnected(self):
         self.mqtt_status_label.setText("MQTT: ❌ disconnected")
@@ -938,42 +994,85 @@ class MainWindow(QMainWindow):
         # 这里可以把收到的消息显示在界面上（你目前没有输出面板，可以自行添加 QTextEdit）
         try:
             data = json.loads(payload)
-            topic_parts = topic.split('/')
-            topic_postfix = topic_parts[len(topic_parts)-1]
+            # topic_parts = topic.split('/')
+            topic_postfix = data.get("action")
             
             if topic_postfix == "cfg":
-                if "cfg" in data and isinstance(data.get("cfg"), list):
-                    self.current_cfg = data["cfg"]
-                    new_freq = data.get("freq", 300)
-                    
-                    # 更新内部变量
-                    self.freq_seconds = new_freq
-                    
-                    # === 关键：同步更新界面上的频率输入框 ===
-                    try:
-                        # 临时断开信号，避免触发 on_freq_changed 导致重复启动
-                        self.freq_input.valueChanged.disconnect(self.on_freq_changed)
-                        self.freq_input.setValue(new_freq)
-                        self.freq_input.valueChanged.connect(self.on_freq_changed)
-                    except:
-                        # 如果信号未连接，直接设置值
-                        self.freq_input.setValue(new_freq)
-                    
-                    
-                    self.status_message_label.setText(f"Receive cfg update | Frequency: {self.freq_seconds}s | tag number: {len(self.current_cfg)}")
-                    
-                    self.read_timer.stop()
-                    if self.freq_seconds > 0:
-                        self.read_timer.start(self.freq_seconds * 1000)
-                    
-                    self.save_current_cfg()
+                self.handle_config_message(data)
+
             elif topic_postfix == "action":
-                # TODO handel relay action
-                pass
+                self.handle_action_message(data)
+                
         except json.JSONDecodeError:
             print(f"Received non-JSON MQTT message on topic {topic}: {payload}")
         except Exception as e:
             print(f"Error processing MQTT message: {e}")
+
+    def handle_action_message(self, data):
+        action_data = data.get("data")
+        slave_id = action_data.get("slave_id", 100)
+        address = action_data.get("coil_ch", 0)
+        val = action_data.get("val", False)
+        device_id = action_data("decide_id")
+        coil_address = action_data("coil_address")
+        coil_count = action_data("coil_count")
+                
+        if not self.check_acutator_status_equal_by_ch(device_id=device_id,ch=address,val=val):
+                    # 发给继电器
+            self.client.write_single_coil_with_slaveid(
+                        slave_id=slave_id,
+                        address=address,
+                        value=val
+                    )
+            # 返回device的actuator的状态
+            self.last_actuator_states[device_id] = self.client.read_coils(
+                        start_addr=coil_address, count=coil_count, slave_id=slave_id)
+        # 通过telemetry返回
+        # TODO: 设计传回temetry的数据结构 传回actuator的执行结果。
+        pass
+
+    def handle_config_message(self, data):
+        updated = False
+                
+                # 原有 cfg 和 freq
+        if "cfg" in data and isinstance(data.get("cfg"), list):
+            self.current_cfg = data["cfg"]
+            updated = True
+
+        if "freq" in data:
+            self.freq_seconds = int(data["freq"])
+            updated = True
+                    
+        if "actuator_cfg" in data and isinstance(data.get("actuator_cfg"), list):
+            self.actuator_cfg = data["actuator_cfg"]
+            updated = True
+
+        if "actuator_freq" in data:
+            self.actuator_freq = int(data["actuator_freq"])
+            updated = True
+
+        if updated:
+            self.status_message_label.setText(
+                        f"收到配置更新 | 普通Tag: {len(self.current_cfg)} | 执行器: {len(self.actuator_cfg)} | "
+                        f"Freq: {self.freq_seconds}s | Actuator Freq: {self.actuator_freq}s"
+                    )
+                    
+                    # === 关键：同步更新界面上的频率输入框 ===
+            try:
+                self.freq_input.valueChanged.disconnect(self.on_freq_changed)
+                self.freq_input.setValue(self.freq_seconds)
+                self.actuator_freq_input.setValue(self.actuator_freq)
+                self.freq_input.valueChanged.connect(self.on_freq_changed)
+            except:
+                self.freq_input.setValue(self.freq_seconds)
+                    
+                    
+            self.save_current_cfg()
+                    
+            if self.read_timer.isActive():
+                self.read_timer.stop()
+            if self.freq_seconds > 0:
+                self.read_timer.start(self.freq_seconds * 1000)
             
     def read_modbus_by_cfg(self):
         """ 根据当前 self.current_cfg 读取 Modbus 数据并通过 MQTT 发布结果 """
@@ -1022,6 +1121,7 @@ class MainWindow(QMainWindow):
                 
         # 构建最终 JSON 并发布
         output_json = {
+            "type": "data",
             "device_sn": self.mqtt.device_sn,
             "timestamp": int(time.time()),
             "data": result_dict
@@ -1035,7 +1135,67 @@ class MainWindow(QMainWindow):
             self.current_output = output_json  # 暂存当前输出，等恢复发布时一起发布
         self.status_message_label.setText(f"Read and published {len(result_dict)} tags")
         print(f"Published to MQTT: {output_json}")
+
+    def read_actuators_by_cfg(self):
+        """Read the discrete input states (function code 02) from 
+        actuator_cfg, and report MQTT only when changes occur."""
+        if not self.actuator_cfg:
+            return
+        if not self.client or not self.client.connected:
+            return
         
+        current_states = {}
+        changed = False
+        
+        for item in self.actuator_cfg:
+            try:
+                device_id = item.get('id')
+                slave_id = item.get("slave_id", 1)
+                reg_address = item.get("reg_address", 0)
+                coil_count = item.get("coil_count", 8)
+                
+                # 这里调用client读取 离散状态 02功能码
+                states = self.client.read_coils(
+                    start_addr=reg_address,
+                    count=coil_count,
+                    slave_id=slave_id
+                )
+                if states is not None:
+                    current_states[device_id] = states
+                    
+                    last_states = self.last_actuator_states.get(device_id)
+                    if last_states != states:
+                        changed = True
+                        print(f"Actuator {device_id} 状态变化: {last_states} -> {states}")
+                else:
+                    print(f"读取离散输入失败: {device_id}")
+                    
+            except Exception as e:
+                print(f"读取 actuator {device_id} 失败: {e}")
+
+        # 更新缓存
+        self.last_actuator_states = current_states.copy()
+        self.update_realtime_display({})
+        
+        if changed and  current_states:
+            print("实现发出actuator states 变化数据")
+            output_json = {
+                "type": "action",
+                "device_sn": self.mqtt.device_sn,
+                "timestamp": int(time.time()),
+                "action": "actuator_status",
+                "data": current_states
+            }
+
+            publish_topic = f"tenants/{self.mqtt_tenant_id_input.text().strip()}/devices/{self.mqtt.device_sn}/telemetry"
+            
+            if not self.pause_mqtt_publish:
+                self.mqtt.publish(publish_topic, json.dumps(output_json), qos=1)
+                self.status_message_label.setText(f"Actuator 状态变化已上报 | {len(current_states)} 个")
+            else:
+                self.current_output = output_json
+            
+
     def on_mqtt_error(self, error_msg):
         self.status_message_label.setText(f"MQTT 错误: {error_msg}")
         self.mqtt_status_label.setText("MQTT: 连接失败")
@@ -1097,7 +1257,7 @@ class MainWindow(QMainWindow):
         except:
             return value
         
-    def update_realtime_display(self, data_dict: dict):
+    def update_realtime_display(self, sensor_dict: dict):
         """更新实时数据 LED 显示"""
         # 清空旧的显示
         while self.realtime_display.count():
@@ -1105,42 +1265,56 @@ class MainWindow(QMainWindow):
             if child.widget():
                 child.widget().deleteLater()
 
-        if not data_dict:
+        if not sensor_dict and not hasattr(self, 'last_actuator_states'):
             no_data = QLabel("暂无数据")
             no_data.setStyleSheet("color: #888; font-size: 14px;")
             self.realtime_display.addWidget(no_data)
             return
+        
+        # ==================== 1. 显示普通 Sensor 数据 ====================
+        if sensor_dict:
+            title_sensor = QLabel("Sensor Data")
+            title_sensor.setStyleSheet("font-weight: bold; color: #00ffcc; font-size: 16px;")
+            self.realtime_display.addWidget(title_sensor)
 
-        for tag, value in data_dict.items():
-            h_layout = QHBoxLayout()
-            
-            # Tag 名称
-            tag_label = QLabel(f"{tag}:")
-            tag_label.setStyleSheet("color: #aaaaaa; font-size: 14px; min-width: 180px;")
-            
-            # 值（LED 风格）
-            value_str = str(value['value'])
-            value_label = QLabel(value_str)
-            value_label.setStyleSheet("""
-                QLabel {
-                    background-color: #003300;
-                    color: #00ff88;
-                    font-size: 16px;
-                    font-weight: bold;
-                    padding: 6px 12px;
-                    border: 2px solid #00cc66;
-                    border-radius: 6px;
-                    min-width: 120px;
-                }
-            """)
-            
-            h_layout.addWidget(tag_label)
-            h_layout.addWidget(value_label)
-            h_layout.addStretch()
-            
-            container = QWidget()
-            container.setLayout(h_layout)
-            self.realtime_display.addWidget(container)
+            for tag, value in sensor_dict.items():
+                h_layout = QHBoxLayout()
+                
+                tag_label = QLabel(f"{tag}:")
+                tag_label.setStyleSheet("color: #aaaaaa; font-size: 14px; min-width: 180px;")
+                
+                value_str = str(value['value'])
+                value_label = QLabel(value_str)
+                value_label.setStyleSheet("""
+                    QLabel {
+                        background-color: #003300;
+                        color: #00ff88;
+                        font-size: 16px;
+                        font-weight: bold;
+                        padding: 6px 12px;
+                        border: 2px solid #00cc66;
+                        border-radius: 6px;
+                        min-width: 120px;
+                    }
+                """)
+                
+                h_layout.addWidget(tag_label)
+                h_layout.addWidget(value_label)
+                h_layout.addStretch()
+                
+                container = QWidget()
+                container.setLayout(h_layout)
+                self.realtime_display.addWidget(container)
+                
+        # ==================== 2. 显示 Actuator 状态（使用自定义控件） ====================
+        if hasattr(self, 'last_actuator_states') and self.last_actuator_states:
+            title_act = QLabel("Actuator Status (Discrete Inputs)")
+            title_act.setStyleSheet("font-weight: bold; color: #00ccff; font-size: 16px; margin-top: 10px;")
+            self.realtime_display.addWidget(title_act)
+
+            for device_id, states in self.last_actuator_states.items():
+                actuator_widget = ActuatorStatusWidget(device_id, states)
+                self.realtime_display.addWidget(actuator_widget)
             
     def closeEvent(self, event):
         """窗口关闭时保存配置"""

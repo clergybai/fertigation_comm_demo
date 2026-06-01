@@ -71,7 +71,7 @@ class MqttClient(QObject):
             self.connected.emit()
             self._generate_device_sn()
             self.subscribe_config_topic()
-            self.subscribe_action_topic()
+            # self.subscribe_action_topic()
             print("Connected to MQTT Broker!")
         else:
             self.connection_error.emit(f"连接失败，错误码: {rc}")
