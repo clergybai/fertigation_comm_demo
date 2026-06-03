@@ -293,21 +293,67 @@ class MainWindow(QMainWindow):
         self.update_coils_display()
     
     def create_realtime_data_panel(self):
-        """创建实时数据 LED 显示面板"""
+        """创建实时数据 LED 显示面板 - 升级为左右分栏无干涉布局"""
         group = QFrame()
         group.setFrameShape(QFrame.StyledPanel)
         group.setStyleSheet("QFrame { background-color: #1e1e1e; border: 1px solid #444; }")
         
-        layout = QVBoxLayout(group)
+        # 整体采用垂直布局：上面放总标题，下面放分栏内容
+        main_vbox = QVBoxLayout(group)
+        main_vbox.setContentsMargins(10, 10, 10, 10)
         
-        title = QLabel("Real-time Data")
-        title.setStyleSheet("font-weight: bold; font-size: 25px; color: #00ffcc; padding: 5px;")
-        layout.addWidget(title)
+        # 总标题
+        title = QLabel("Real-time Data Monitor")
+        title.setStyleSheet("font-weight: bold; font-size: 25px; color: #00ffcc; padding-bottom: 5px; border-bottom: 1px solid #333;")
+        main_vbox.addWidget(title)
 
-        # 用于显示数据的容器
-        self.realtime_display = QVBoxLayout()
-        layout.addLayout(self.realtime_display)
+        # 🌟 核心：创建左右分栏的水平布局
+        split_layout = QHBoxLayout()
+        split_layout.setSpacing(20)  # 左右两侧的间距
 
+        # --- 【左分栏】：Sensor 区域 ---
+        sensor_box = QWidget()
+        sensor_box.setStyleSheet("QWidget { border: none; background: transparent; }")
+        self.sensor_display = QVBoxLayout(sensor_box)
+        self.sensor_display.setContentsMargins(0, 5, 0, 0)
+        
+        sensor_title = QLabel("📡 Sensors / Tags")
+        sensor_title.setStyleSheet("color: #00ffff; font-size: 20px; font-weight: bold;")
+        self.sensor_display.addWidget(sensor_title)
+        self.sensor_display.addSpacing(5)
+        # 这里预留一个容纳动态数据的垂直布局
+        self.sensor_data_container = QVBoxLayout()
+        self.sensor_display.addLayout(self.sensor_data_container)
+        self.sensor_display.addStretch(1) # 撑起底部
+
+        # --- 【右分栏】：Actuator 区域 ---
+        actuator_box = QWidget()
+        actuator_box.setStyleSheet("QWidget { border: none; background: transparent; }")
+        self.actuator_display = QVBoxLayout(actuator_box)
+        self.actuator_display.setContentsMargins(0, 5, 0, 0)
+        
+        actuator_title = QLabel("⚙️ Actuators / Relays")
+        actuator_title.setStyleSheet("color: #ff9900; font-size: 20px; font-weight: bold;")
+        self.actuator_display.addWidget(actuator_title)
+        self.actuator_display.addSpacing(5)
+        # 这里预留一个容纳动态数据的垂直布局
+        self.actuator_data_container = QVBoxLayout()
+        self.actuator_display.addLayout(self.actuator_data_container)
+        self.actuator_display.addStretch(1) # 撑起底部
+
+        # 将左右两块塞入分栏布局
+        split_layout.addWidget(sensor_box, stretch=1)
+        
+        # 中间加一条暗色的垂直分界线，让界面更精致
+        v_line = QFrame()
+        v_line.setFrameShape(QFrame.VLine)
+        v_line.setStyleSheet("background-color: #333333;")
+        split_layout.addWidget(v_line)
+        
+        split_layout.addWidget(actuator_box, stretch=1)
+
+        # 把分栏布局塞回主面板
+        main_vbox.addLayout(split_layout)
         self.main_layout.addWidget(group)
     
     def create_status_bar(self):
@@ -1013,9 +1059,9 @@ class MainWindow(QMainWindow):
         slave_id = action_data.get("slave_id", 100)
         address = action_data.get("coil_ch", 0)
         val = action_data.get("val", False)
-        device_id = action_data("decide_id")
-        coil_address = action_data("coil_address")
-        coil_count = action_data("coil_count")
+        device_id = action_data.get("device_id")
+        coil_address = action_data.get("coil_address")
+        coil_count = action_data.get("coil_count")
                 
         if not self.check_acutator_status_equal_by_ch(device_id=device_id,ch=address,val=val):
                     # 发给继电器
@@ -1027,6 +1073,18 @@ class MainWindow(QMainWindow):
             # 返回device的actuator的状态
             self.last_actuator_states[device_id] = self.client.read_coils(
                         start_addr=coil_address, count=coil_count, slave_id=slave_id)
+            
+            current_states = {}
+            current_states[device_id] = self.last_actuator_states[device_id]
+            output_json = {
+                "type": "action",
+                "device_sn": self.mqtt.device_sn,
+                "timestamp": int(time.time()),
+                "action": "actuator_status",
+                "data": current_states
+            }
+            publish_topic = f"tenants/{self.mqtt_tenant_id_input.text().strip()}/devices/{self.mqtt.device_sn}/telemetry"
+            self.mqtt.publish(publish_topic, json.dumps(output_json), qos=0)
         # 通过telemetry返回
         # TODO: 设计传回temetry的数据结构 传回actuator的执行结果。
         pass
@@ -1175,7 +1233,7 @@ class MainWindow(QMainWindow):
 
         # 更新缓存
         self.last_actuator_states = current_states.copy()
-        self.update_realtime_display({})
+        self.update_realtime_display(None)
         
         if changed and  current_states:
             print("实现发出actuator states 变化数据")
@@ -1257,64 +1315,150 @@ class MainWindow(QMainWindow):
         except:
             return value
         
-    def update_realtime_display(self, sensor_dict: dict):
-        """更新实时数据 LED 显示"""
-        # 清空旧的显示
-        while self.realtime_display.count():
-            child = self.realtime_display.takeAt(0)
-            if child.widget():
-                child.widget().deleteLater()
+    # def update_realtime_display(self, sensor_dict: dict = None):
+    #     """更新实时数据 LED 显示"""
+    #     # 清空旧的显示
+    #     while self.realtime_display.count():
+    #         child = self.realtime_display.takeAt(0)
+    #         if child.widget():
+    #             child.widget().deleteLater()
 
-        if not sensor_dict and not hasattr(self, 'last_actuator_states'):
-            no_data = QLabel("暂无数据")
-            no_data.setStyleSheet("color: #888; font-size: 14px;")
-            self.realtime_display.addWidget(no_data)
-            return
+    #     if not sensor_dict and not hasattr(self, 'last_actuator_states'):
+    #         no_data = QLabel("暂无数据")
+    #         no_data.setStyleSheet("color: #888; font-size: 14px;")
+    #         self.realtime_display.addWidget(no_data)
+    #         return
         
-        # ==================== 1. 显示普通 Sensor 数据 ====================
-        if sensor_dict:
-            title_sensor = QLabel("Sensor Data")
-            title_sensor.setStyleSheet("font-weight: bold; color: #00ffcc; font-size: 16px;")
-            self.realtime_display.addWidget(title_sensor)
+    #     # ==================== 1. 显示普通 Sensor 数据 ====================
+    #     if sensor_dict:
+    #         title_sensor = QLabel("Sensor Data")
+    #         title_sensor.setStyleSheet("font-weight: bold; color: #00ffcc; font-size: 16px;")
+    #         self.realtime_display.addWidget(title_sensor)
 
-            for tag, value in sensor_dict.items():
-                h_layout = QHBoxLayout()
+    #         for tag, value in sensor_dict.items():
+    #             h_layout = QHBoxLayout()
                 
-                tag_label = QLabel(f"{tag}:")
-                tag_label.setStyleSheet("color: #aaaaaa; font-size: 14px; min-width: 180px;")
+    #             tag_label = QLabel(f"{tag}:")
+    #             tag_label.setStyleSheet("color: #aaaaaa; font-size: 14px; min-width: 180px;")
                 
-                value_str = str(value['value'])
-                value_label = QLabel(value_str)
-                value_label.setStyleSheet("""
-                    QLabel {
-                        background-color: #003300;
-                        color: #00ff88;
-                        font-size: 16px;
-                        font-weight: bold;
-                        padding: 6px 12px;
-                        border: 2px solid #00cc66;
-                        border-radius: 6px;
-                        min-width: 120px;
-                    }
-                """)
+    #             value_str = str(value['value'])
+    #             value_label = QLabel(value_str)
+    #             value_label.setStyleSheet("""
+    #                 QLabel {
+    #                     background-color: #003300;
+    #                     color: #00ff88;
+    #                     font-size: 16px;
+    #                     font-weight: bold;
+    #                     padding: 6px 12px;
+    #                     border: 2px solid #00cc66;
+    #                     border-radius: 6px;
+    #                     min-width: 120px;
+    #                 }
+    #             """)
                 
-                h_layout.addWidget(tag_label)
-                h_layout.addWidget(value_label)
-                h_layout.addStretch()
+    #             h_layout.addWidget(tag_label)
+    #             h_layout.addWidget(value_label)
+    #             h_layout.addStretch()
                 
-                container = QWidget()
-                container.setLayout(h_layout)
-                self.realtime_display.addWidget(container)
+    #             container = QWidget()
+    #             container.setLayout(h_layout)
+    #             self.realtime_display.addWidget(container)
                 
-        # ==================== 2. 显示 Actuator 状态（使用自定义控件） ====================
-        if hasattr(self, 'last_actuator_states') and self.last_actuator_states:
-            title_act = QLabel("Actuator Status (Discrete Inputs)")
-            title_act.setStyleSheet("font-weight: bold; color: #00ccff; font-size: 16px; margin-top: 10px;")
-            self.realtime_display.addWidget(title_act)
+    #     # ==================== 2. 显示 Actuator 状态（使用自定义控件） ====================
+    #     if hasattr(self, 'last_actuator_states') and self.last_actuator_states:
+    #         title_act = QLabel("Actuator Status (Discrete Inputs)")
+    #         title_act.setStyleSheet("font-weight: bold; color: #00ccff; font-size: 16px; margin-top: 10px;")
+    #         self.realtime_display.addWidget(title_act)
 
-            for device_id, states in self.last_actuator_states.items():
-                actuator_widget = ActuatorStatusWidget(device_id, states)
-                self.realtime_display.addWidget(actuator_widget)
+    #         for device_id, states in self.last_actuator_states.items():
+    #             actuator_widget = ActuatorStatusWidget(device_id, states)
+    #             self.realtime_display.addWidget(actuator_widget)
+
+    def update_realtime_display(self, sensor_dict: dict = None):
+        """
+        更新实时数据 LED 显示（支持左右分栏局部增量刷新，互不干涉）
+        """
+        # ==================== 1. 定向更新左侧 Sensor 区域 ====================
+        # 只有在传入了有效的传感器字典时，才刷新左边
+        if sensor_dict is not None:
+            # 🌟 精准清空：只铲除左侧传感器容器里的旧组件，右侧安然无恙
+            while self.sensor_data_container.count():
+                child = self.sensor_data_container.takeAt(0)
+                if child.widget():
+                    child.widget().deleteLater()
+
+            if sensor_dict:
+                title_sensor = QLabel("Sensor Data")
+                title_sensor.setStyleSheet("font-weight: bold; color: #00ffcc; font-size: 16px;")
+                self.sensor_data_container.addWidget(title_sensor)
+
+                for tag, value in sensor_dict.items():
+                    h_layout = QHBoxLayout()
+                    
+                    tag_label = QLabel(f"{tag}:")
+                    tag_label.setStyleSheet("color: #aaaaaa; font-size: 14px; min-width: 180px;")
+                    
+                    value_str = str(value['value'])
+                    value_label = QLabel(value_str)
+                    value_label.setStyleSheet("""
+                        QLabel {
+                            background-color: #003300;
+                            color: #00ff88;
+                            font-size: 16px;
+                            font-weight: bold;
+                            padding: 6px 12px;
+                            border: 2px solid #00cc66;
+                            border-radius: 6px;
+                            min-width: 120px;
+                        }
+                    """)
+                    
+                    h_layout.addWidget(tag_label)
+                    h_layout.addWidget(value_label)
+                    h_layout.addStretch()
+                    
+                    container = QWidget()
+                    container.setLayout(h_layout)
+                    self.sensor_data_container.addWidget(container)
+            else:
+                # 传入的是空字典 {}
+                no_data = QLabel("暂无传感器数据")
+                no_data.setStyleSheet("color: #888; font-size: 14px;")
+                self.sensor_data_container.addWidget(no_data)
+            
+            # 垫个弹簧保持左侧紧凑
+            self.sensor_data_container.addStretch(1)
+
+        # ==================== 2. 定向更新右侧 Actuator 区域 ====================
+        # 无论传感器带不带数据，只要内存里有执行器数据，或者显式触发了更新，就只刷新右边
+        # 如果你不希望每次更新传感器都重绘右边，可以加个控制。这里我们让它在有状态、或者显式更新时起作用。
+        # 优雅策略：如果是常规传感器轮询，右边可以不重复绘制；但为了保险，我们让它在有变动时才单独重绘
+        
+        # 🌟 完美的解耦刷新逻辑：
+        # 如果传感器数据为 None（说明是执行器任务单独触发），或者日常传感器更新时顺便检查右侧是否为空
+        if sensor_dict is None or self.actuator_data_container.count() == 0:
+            
+            # 🌟 精准清空：只铲除右侧执行器容器里的旧组件，左侧传感器由于没有被铲除，数字绝不会跳动或闪烁
+            while self.actuator_data_container.count():
+                child = self.actuator_data_container.takeAt(0)
+                if child.widget():
+                    child.widget().deleteLater()
+
+            if hasattr(self, 'last_actuator_states') and self.last_actuator_states:
+                title_act = QLabel("Actuator Status (Discrete Inputs)")
+                title_act.setStyleSheet("font-weight: bold; color: #00ccff; font-size: 16px;")
+                self.actuator_data_container.addWidget(title_act)
+
+                for device_id, states in self.last_actuator_states.items():
+                    actuator_widget = ActuatorStatusWidget(device_id, states)
+                    self.actuator_data_container.addWidget(actuator_widget)
+            else:
+                no_act_data = QLabel("暂无执行器状态")
+                no_act_data.setStyleSheet("color: #888; font-size: 14px;")
+                self.actuator_data_container.addWidget(no_act_data)
+                
+            # 垫个弹簧保持右侧紧凑
+            self.actuator_data_container.addStretch(1)
             
     def closeEvent(self, event):
         """窗口关闭时保存配置"""

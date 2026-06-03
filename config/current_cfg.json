@@ -1,5 +1,24 @@
 {
-  "cfg": [],
+  "cfg": [
+    {
+      "id": "e83cd5af-6367-49f7-b3bc-73292234b689",
+      "tag_code": "air_humidity",
+      "slave_id": 1,
+      "reg_address": 0,
+      "count": 1,
+      "data_type": "uint16",
+      "scale": 0.1
+    },
+    {
+      "id": "70842311-a7dd-44c2-aeda-d4ad7c928c83",
+      "tag_code": "air_temperature",
+      "slave_id": 1,
+      "reg_address": 1,
+      "count": 1,
+      "data_type": "uint16",
+      "scale": 0.1
+    }
+  ],
   "freq": 10,
   "actuator_cfg": [
     {
