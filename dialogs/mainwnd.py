@@ -936,7 +936,7 @@ class MainWindow(QMainWindow):
         self.mqtt.connected.connect(self.on_mqtt_connected)
         self.mqtt.disconnected.connect(self.on_mqtt_disconnected)
         self.mqtt.message_received.connect(self.on_mqtt_message_received)
-        self.mqtt.error_occurred.connect(self.on_mqtt_error)
+        self.mqtt.connection_error.connect(self.on_mqtt_error)
         
         self.mqtt.connect_to_broker()
         
@@ -1258,6 +1258,12 @@ class MainWindow(QMainWindow):
         self.status_message_label.setText(f"MQTT 错误: {error_msg}")
         self.mqtt_status_label.setText("MQTT: 连接失败")
         self.mqtt_status_label.setStyleSheet("color: red;")
+
+        QMessageBox.warning(
+            self,
+            "MQTT Connection Failed",
+            error_msg
+    )
         
     def on_device_sn_generated(self, sn: str):
         """接收生成的设备 SN"""
