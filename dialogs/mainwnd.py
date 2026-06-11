@@ -992,8 +992,20 @@ class MainWindow(QMainWindow):
     def on_actuator_freq_changed(self, new_freq: int):
         """用户手动修改执行器频率时实时生效"""
         self.actuator_freq = new_freq
-        self.status_message_label.setText(f"执行器频率已修改为: {new_freq} 秒")
-        
+
+        if self.client and self.client.connected:
+            if self.actuator_read_timer.isActive():
+                self.actuator_read_timer.stop
+            
+            if new_freq > 0:
+                self.actuator_read_timer.start(new_freq * 1000)
+                self.status_message_label.setText(
+                    f"执行器频率已修改为:{new_freq}秒"
+                )
+            else:
+                self.status_message_label.setText(
+                    f"执行器频率已修改为:{new_freq}秒（串口未打开，暂不启动读取）"
+                )
         # 保存配置
         self.save_current_cfg()
 
@@ -1073,6 +1085,9 @@ class MainWindow(QMainWindow):
             # 返回device的actuator的状态
             self.last_actuator_states[device_id] = self.client.read_coils(
                         start_addr=coil_address, count=coil_count, slave_id=slave_id)
+            
+            self.relay_status = self.last_actuator_states[device_id][:self.coil_count_spin.value()]
+            self.update_coils_display()
             
             current_states = {}
             current_states[device_id] = self.last_actuator_states[device_id]
@@ -1211,7 +1226,6 @@ class MainWindow(QMainWindow):
                 slave_id = item.get("slave_id", 1)
                 reg_address = item.get("reg_address", 0)
                 coil_count = item.get("coil_count", 8)
-                
                 # 这里调用client读取 离散状态 02功能码
                 states = self.client.read_coils(
                     start_addr=reg_address,
