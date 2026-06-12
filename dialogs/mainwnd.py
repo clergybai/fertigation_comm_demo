@@ -295,6 +295,7 @@ class MainWindow(QMainWindow):
     def create_realtime_data_panel(self):
         """创建实时数据 LED 显示面板 - 升级为左右分栏无干涉布局"""
         group = QFrame()
+        self.realtime_group = group
         group.setFrameShape(QFrame.StyledPanel)
         group.setStyleSheet("QFrame { background-color: #1e1e1e; border: 1px solid #444; }")
         
@@ -354,7 +355,7 @@ class MainWindow(QMainWindow):
 
         # 把分栏布局塞回主面板
         main_vbox.addLayout(split_layout)
-        self.main_layout.addWidget(group)
+        self.main_layout.addWidget(group, stretch=3)
     
     def create_status_bar(self):
         self.status_bar = QStatusBar()
@@ -409,8 +410,13 @@ class MainWindow(QMainWindow):
     
     def create_mqtt_panel(self):
         group = QFrame()
+        self.mqtt_group = group
         group.setFrameShape(QFrame.StyledPanel)
         layout = QVBoxLayout(group)
+
+        self.mqtt_layout = layout
+        btn_layout = QHBoxLayout()
+        self.mqtt_btn_layout = btn_layout
 
         title = QLabel("MQTT Broker Configuration")
         title.setStyleSheet("font-weight: bold; font-size: 14px;")
@@ -497,6 +503,22 @@ class MainWindow(QMainWindow):
         self.mannal_publish_btn = QPushButton("Manual Publish")
         self.mannal_publish_btn.clicked.connect(self.manual_publish)
         self.mqtt_disconnect_btn.setEnabled(False)
+
+        self.mqtt_controls = [
+            self.mqtt_broker_input,
+            self.mqtt_port_input,
+            self.mqtt_tenant_id_input,
+            self.freq_input,
+            self.actuator_freq_input,
+            self.mqtt_ca_btn,
+            self.mqtt_username_input,
+            self.mqtt_password_input,
+            self.mqtt_connect_btn,
+            self.mqtt_disconnect_btn,
+            self.pause_mqtt_publish_btn,
+            self.mannal_publish_btn,
+        ]
+        
         btn_layout.addWidget(self.mqtt_connect_btn)
         btn_layout.addWidget(self.mqtt_disconnect_btn)
         btn_layout.addWidget(self.pause_mqtt_publish_btn)
@@ -508,13 +530,14 @@ class MainWindow(QMainWindow):
         layout.addLayout(auth_layout)
         layout.addLayout(btn_layout)
 
-        self.main_layout.addWidget(group)
+        self.main_layout.addWidget(group, stretch=2)
         
         self.mqtt.device_sn_generated.connect(self.on_device_sn_generated) 
 
     def create_log_panel(self):
         """新增 Modbus 通信日志面板"""
         group = QFrame()
+        self.log_group = group
         group.setFrameShape(QFrame.StyledPanel)
         group.setStyleSheet("""
             QFrame {
@@ -526,9 +549,22 @@ class MainWindow(QMainWindow):
 
         layout = QVBoxLayout(group)
         
-        title = QLabel("Modbus Communication Log")
-        title.setStyleSheet("font-weight: bold; font-size: 24px; color: #0066cc; padding: 5px;")
-        layout.addWidget(title)
+        # 折叠/展开按钮
+        self.log_visible = True
+        self.log_toggle_btn = QPushButton("▼ Modbus Communication Log")
+        self.log_toggle_btn.setStyleSheet("""
+            QPushButton {
+                font-weight: bold;
+                font-size: 24px;
+                color: #0066cc;
+                text-align: left;
+                padding: 5px;
+                border: none;
+                background-color: transparent;
+            }
+        """)
+        self.log_toggle_btn.clicked.connect(self.toggle_log_panel)
+        layout.addWidget(self.log_toggle_btn)
 
         # 日志显示区域
         self.log_text = QTextEdit()
@@ -547,11 +583,48 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.log_text)
         
         # 清除日志按钮
-        clear_btn = QPushButton("Clear Log")
-        clear_btn.clicked.connect(self.clear_log)
-        layout.addWidget(clear_btn)
+        self.clear_log_btn = QPushButton("Clear Log")
+        self.clear_log_btn.clicked.connect(self.clear_log)
+        layout.addWidget(self.clear_log_btn)
 
-        self.main_layout.addWidget(group, stretch=1)
+        self.main_layout.addWidget(group)
+
+    def toggle_log_panel(self):
+        self.log_visible = not self.log_visible
+
+        self.log_text.setVisible(self.log_visible)
+        self.clear_log_btn.setVisible(self.log_visible)
+
+        if self.log_visible:
+            self.log_toggle_btn.setText("▼ Modbus Communication Log")
+            self.log_text.setMinimumHeight(180)
+            self.log_text.setMaximumHeight(16777215)
+
+            if self.client:
+                self.client.set_log_enabled(True)
+
+            # MQTT区域恢复正常布局
+            self.mqtt_layout.setSpacing(6)
+            self.mqtt_layout.setContentsMargins(9, 9, 9, 9)
+            self.mqtt_btn_layout.setSpacing(6)
+
+            for control in self.mqtt_controls:
+                control.setMinimumHeight(0)
+        else:
+            self.log_toggle_btn.setText("▶ Modbus Communication Log")
+            self.log_text.setMinimumHeight(0)
+            self.log_text.setMaximumHeight(0)
+
+            if self.client:
+                self.client.set_log_enabled(False)
+
+            # MQTT区域利用释放出来的空间
+            self.mqtt_layout.setSpacing(18)
+            self.mqtt_layout.setContentsMargins(18, 18, 18, 18)
+            self.mqtt_btn_layout.setSpacing(20)
+
+            for control in self.mqtt_controls:
+                control.setMinimumHeight(42)
     
     def save_mqtt_settings(self):
         """保存 MQTT 配置到本地文件"""
@@ -668,6 +741,8 @@ class MainWindow(QMainWindow):
         
         if self.client and self.client.connected:
             self.client.close()
+            self.client = None
+
             self.confirm_btn.setText("Open Serial Port")
             QMessageBox.information(self, "Info", f"Serial port {self.selected_port} closed")
             return
@@ -683,6 +758,9 @@ class MainWindow(QMainWindow):
                 slave_id=self.slave_id_spinbox.get_slave_id(),
                 timeout=1,
                 main_window=self)
+            
+            self.client.set_log_enabled(self.log_visible)
+
             if self.client.connect():
                 self.confirm_btn.setText("Close Serial Port")
                 self.status_message_label.setText(f"串口 {self.selected_port} 已打开")
@@ -1548,7 +1626,7 @@ class MainWindow(QMainWindow):
 
     def append_log(self, direction: str, data: bytes):
         """向日志区域添加收发报文"""
-        if not self.log_text:
+        if not self.log_text or not self.log_visible:
             return
             
         timestamp = time.strftime("%H:%M:%S")
@@ -1568,7 +1646,7 @@ class MainWindow(QMainWindow):
         
     def append_log_raw(self, text: str):
         """添加原始串口报文或普通文本到日志"""
-        if not self.log_text:
+        if not self.log_text or not self.log_visible:
             return
         
         # if self.is_controlling_now and "01 01" in text:
