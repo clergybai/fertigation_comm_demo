@@ -163,6 +163,8 @@ class ModbusRTUClient:
                  timeout: float = 1.0,
                  main_window=None):
         
+        self.log_enabled = True
+
         self.slave_id = slave_id
         self.port = port
         self.connected = False
@@ -178,6 +180,9 @@ class ModbusRTUClient:
             timeout=timeout,
             # method='rtu'   # pymodbus 3.x 默认就是 rtu，可不写
         )
+
+    def set_log_enabled(self, enabled: bool):
+        self.log_enabled = enabled
 
     def connect(self) -> bool:
         """连接设备并全自动精准拦截 Modbus 物理层收发报文"""
@@ -255,7 +260,7 @@ class ModbusRTUClient:
             pymodbus_logger = logging.getLogger("pymodbus")
             if not hasattr(pymodbus_logger, '_ui_handler_present'):
                 pymodbus_logger._ui_handler_present = True
-                
+
                 class SimpleUiLogHandler(logging.Handler):
                     def __init__(self, outer_instance):
                         super().__init__()
@@ -275,7 +280,7 @@ class ModbusRTUClient:
                                     self.outer._log_raw_packet("RX", bytes(clean_bytes))
                         except Exception:
                             pass
-                            
+
                 pymodbus_logger.addHandler(SimpleUiLogHandler(self))
                 
         except Exception as e:
@@ -293,7 +298,6 @@ class ModbusRTUClient:
             logger.info("Modbus RTU connection closed")
         except Exception as e:
             logger.error(f"Error closing connection: {e}")
-        
         return self.connected
 
     def _read_holding_reg(self, address: int, count: int, debug: bool = True) -> Optional[list]:
@@ -793,6 +797,10 @@ class ModbusRTUClient:
 
     def _log_raw_packet(self, direction: str, data: bytes):
         """将原始字节流转换成带颜色样式的文本送给 append_log_raw"""
+
+        if not self.log_enabled:
+            return
+        
         if hasattr(self, 'main_window') and self.main_window:
             # 将字节流转换为以空格分隔的规整十六进制串，例如：01 03 00 80
             hex_str = " ".join(f"{b:02X}" for b in data)

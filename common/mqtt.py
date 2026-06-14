@@ -71,10 +71,20 @@ class MqttClient(QObject):
             self.connected.emit()
             self._generate_device_sn()
             self.subscribe_config_topic()
-            # self.subscribe_action_topic()
             print("Connected to MQTT Broker!")
         else:
-            self.connection_error.emit(f"连接失败，错误码: {rc}")
+            error_messages = {
+                4: "用户名或密码错误",
+                5: "未授权，请检查用户名、密码或 Tenant ID",
+            }
+
+            self.connection_error.emit(
+                error_messages.get(rc, f"连接失败，错误码: {rc}")
+            )
+
+        # important: stop retrying
+            client.loop_stop()
+            client.disconnect()
 
     def set_tenant_id(self, tenant_id: str):
         """设置 Tenant ID"""
@@ -89,6 +99,10 @@ class MqttClient(QObject):
 
     def on_disconnect(self, client, userdata, rc):
         self.disconnected.emit()
+        if rc != 0:
+            self.connection_error.emit(
+            f"MQTT连接异常断开，错误码: {rc}。请检查用户名、密码、Tenant ID 或 Broker 地址。"
+        )
 
     def connect_to_broker(self):
         if not self.broker.strip():
