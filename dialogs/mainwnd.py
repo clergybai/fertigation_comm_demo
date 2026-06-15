@@ -4,7 +4,7 @@ import json
 from PyQt5 import QtWidgets
 from PyQt5.QtWidgets import QAction, QApplication, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QMainWindow, QMenu, QMessageBox, QPushButton, QScrollArea, QSpinBox, QStatusBar, QTextEdit, QVBoxLayout, QWidget, QLineEdit
 from modbus.modbus_rtu import AsyncModbusRTUClient, ModbusRTUClient
-from PyQt5.QtCore import QTimer, Qt
+from PyQt5.QtCore import QTimer, Qt, QThread, pyqtSignal
 import serial.tools.list_ports
 from widgets.combobox import BaudrateComboBox, ConverterComboBox, DataBitsComboBox, ParityComboBox, StopBitsComboBox
 from widgets.actuator_status_widget import ActuatorStatusWidget
@@ -15,12 +15,16 @@ from widgets.spinbox import SlaveIdSpinBox
 from common.mqtt import MqttClient
 from PyQt5.QtCore import QSettings
 import os
+from modbus.modbus_scan_worker import ModbusScanWorker
 
 from widgets.toggle_button import ToggleToolButton
 
 
 class MainWindow(QMainWindow):
-    
+    scan_config_updated = pyqtSignal(dict)
+    scan_action_requested = pyqtSignal(dict)
+    scan_stop_requested = pyqtSignal()
+
     def __init__(self):
         super(MainWindow, self).__init__()
         self.setWindowTitle("Modbus RTU Client Tool")
@@ -41,10 +45,10 @@ class MainWindow(QMainWindow):
         # last_actuator_states record last discrete status
         self.last_actuator_states = {}
         self.read_timer = QTimer()
-        self.read_timer.timeout.connect(self.read_modbus_by_cfg)
+        #self.read_timer.timeout.connect(self.read_modbus_by_cfg)
         
         self.actuator_read_timer = QTimer()
-        self.actuator_read_timer.timeout.connect(self.read_actuators_by_cfg)
+        #self.actuator_read_timer.timeout.connect(self.read_actuators_by_cfg)
         
         self.current_output = None
         self.pause_mqtt_publish = False
@@ -693,8 +697,7 @@ class MainWindow(QMainWindow):
             self.current_cfg = data.get("cfg", {})
             self.freq_seconds = data.get("freq", 300)
             self.actuator_cfg = data.get("actuator_cfg", [])
-            self.actuator_freq = data.get("actuator_freq", 300)
-            
+            self.actuator_freq = data.get("actuator_freq", 10)
             try:
                 if hasattr(self, 'actuator_freq_input'):
                     self.actuator_freq_input.setValue(self.actuator_freq)
@@ -740,6 +743,9 @@ class MainWindow(QMainWindow):
             return
         
         if self.client and self.client.connected:
+            # 先停止扫描线程，避免 worker 继续使用已经关闭的 serial client
+            self.stop_modbus_scan_worker()
+
             self.client.close()
             self.client = None
 
@@ -757,13 +763,23 @@ class MainWindow(QMainWindow):
                 stopbits=self.stopbits_combo.get_current_stop_bits(),
                 slave_id=self.slave_id_spinbox.get_slave_id(),
                 timeout=1,
-                main_window=self)
+                main_window=None)
             
+            self.client.log_emitter.raw_log.connect(self.append_log_raw)
             self.client.set_log_enabled(self.log_visible)
 
             if self.client.connect():
                 self.confirm_btn.setText("Close Serial Port")
                 self.status_message_label.setText(f"串口 {self.selected_port} 已打开")
+
+                self.start_modbus_scan_worker()
+
+                self.scan_config_updated.emit({
+                    "cfg": self.current_cfg,
+                    "freq": self.freq_seconds,
+                    "actuator_cfg": self.actuator_cfg,
+                    "actuator_freq": self.actuator_freq,
+                    })
                 
                 # 如果已经有配置，则启动定时读取
                 # if self.current_cfg and self.freq_seconds > 0:
@@ -964,7 +980,6 @@ class MainWindow(QMainWindow):
         try:
             # 功能码 01：读取线圈状态
             response = self.client.read_coils(start_addr=0, count=count)
-            
             if response is not None:
                 self.relay_status = response[:count]  # 更新缓存
                 self.update_coils_display()
@@ -1053,38 +1068,29 @@ class MainWindow(QMainWindow):
     def on_freq_changed(self, new_freq: int):
         """用户手动修改读取频率时实时生效"""
         self.freq_seconds = new_freq
-        
-        # 只有当串口已经打开时才启动定时器
+
+        # 旧逻辑：不再启动 GUI 主线程 read_timer
+        # 新逻辑：通知 worker 使用新频率
+        self.emit_scan_config_to_worker()
+
         if self.client and self.client.connected:
-            if self.read_timer.isActive():
-                self.read_timer.stop()
-            if new_freq > 0:
-                self.read_timer.start(new_freq * 1000)
-                self.status_message_label.setText(f"读取频率已修改为: {new_freq} 秒")
+            self.status_message_label.setText(f"读取频率已修改为: {new_freq} 秒")
         else:
             self.status_message_label.setText(f"频率已设置为 {new_freq} 秒（串口未打开，暂不启动读取）")
-        
-        # 保存到配置文件
+
         self.save_current_cfg()
         
     def on_actuator_freq_changed(self, new_freq: int):
-        """用户手动修改执行器频率时实时生效"""
+        """用户手动修改 actuator 读取频率时实时生效"""
         self.actuator_freq = new_freq
 
+        self.emit_scan_config_to_worker()
+
         if self.client and self.client.connected:
-            if self.actuator_read_timer.isActive():
-                self.actuator_read_timer.stop
-            
-            if new_freq > 0:
-                self.actuator_read_timer.start(new_freq * 1000)
-                self.status_message_label.setText(
-                    f"执行器频率已修改为:{new_freq}秒"
-                )
-            else:
-                self.status_message_label.setText(
-                    f"执行器频率已修改为:{new_freq}秒（串口未打开，暂不启动读取）"
-                )
-        # 保存配置
+            self.status_message_label.setText(f"Actuator 读取频率已修改为: {new_freq} 秒")
+        else:
+            self.status_message_label.setText(f"Actuator 频率已设置为 {new_freq} 秒（串口未打开，暂不启动读取）")
+
         self.save_current_cfg()
 
     # 信号槽
@@ -1146,41 +1152,16 @@ class MainWindow(QMainWindow):
 
     def handle_action_message(self, data):
         action_data = data.get("data")
-        slave_id = action_data.get("slave_id", 100)
-        address = action_data.get("coil_ch", 0)
-        val = action_data.get("val", False)
-        device_id = action_data.get("device_id")
-        coil_address = action_data.get("coil_address")
-        coil_count = action_data.get("coil_count")
-                
-        if not self.check_acutator_status_equal_by_ch(device_id=device_id,ch=address,val=val):
-                    # 发给继电器
-            self.client.write_single_coil_with_slaveid(
-                        slave_id=slave_id,
-                        address=address,
-                        value=val
-                    )
-            # 返回device的actuator的状态
-            self.last_actuator_states[device_id] = self.client.read_coils(
-                        start_addr=coil_address, count=coil_count, slave_id=slave_id)
-            
-            self.relay_status = self.last_actuator_states[device_id][:self.coil_count_spin.value()]
-            self.update_coils_display()
-            
-            current_states = {}
-            current_states[device_id] = self.last_actuator_states[device_id]
-            output_json = {
-                "type": "action",
-                "device_sn": self.mqtt.device_sn,
-                "timestamp": int(time.time()),
-                "action": "actuator_status",
-                "data": current_states
-            }
-            publish_topic = f"tenants/{self.mqtt_tenant_id_input.text().strip()}/devices/{self.mqtt.device_sn}/telemetry"
-            self.mqtt.publish(publish_topic, json.dumps(output_json), qos=0)
-        # 通过telemetry返回
-        # TODO: 设计传回temetry的数据结构 传回actuator的执行结果。
-        pass
+
+        if not action_data:
+            self.status_message_label.setText("Invalid action message: missing data")
+            return
+
+        if not hasattr(self, "scan_worker") or not self.scan_worker:
+            self.status_message_label.setText("Scan worker not running, action skipped")
+            return
+
+        self.scan_action_requested.emit(action_data)
 
     def handle_config_message(self, data):
         updated = False
@@ -1219,11 +1200,10 @@ class MainWindow(QMainWindow):
                     
                     
             self.save_current_cfg()
+
+        if hasattr(self, "scan_worker") and self.scan_worker:
+            self.emit_scan_config_to_worker()
                     
-            if self.read_timer.isActive():
-                self.read_timer.stop()
-            if self.freq_seconds > 0:
-                self.read_timer.start(self.freq_seconds * 1000)
             
     def read_modbus_by_cfg(self):
         """ 根据当前 self.current_cfg 读取 Modbus 数据并通过 MQTT 发布结果 """
@@ -1679,3 +1659,172 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "警告", "请先打开串口！")
             return False
         return True
+    
+    def start_modbus_scan_worker(self):
+        if not self.client or not self.client.connected:
+            return
+
+        if hasattr(self, "scan_thread") and self.scan_thread and self.scan_thread.isRunning():
+            return
+
+        self.scan_thread = QThread(self)
+        self.scan_worker = ModbusScanWorker(client=self.client)
+
+        self.scan_worker.moveToThread(self.scan_thread)
+
+        self.scan_thread.started.connect(self.scan_worker.start_loop)
+
+        self.scan_config_updated.connect(
+            self.scan_worker.update_config,
+            Qt.DirectConnection
+        )
+
+        self.scan_action_requested.connect(
+            self.scan_worker.enqueue_action,
+            Qt.DirectConnection
+        )
+
+        self.scan_stop_requested.connect(
+            self.scan_worker.stop_loop,
+            Qt.DirectConnection
+        )
+
+        self.scan_worker.sensor_data_ready.connect(self.on_sensor_data_ready)
+        self.scan_worker.actuator_status_ready.connect(self.on_actuator_status_ready)
+        self.scan_worker.action_result_ready.connect(self.on_action_result_ready)
+        self.scan_worker.status_message.connect(self.status_message_label.setText)
+        self.scan_worker.error_occurred.connect(self.on_scan_worker_error)
+
+        self.scan_thread.start()
+
+        self.scan_config_updated.emit({
+            "cfg": self.current_cfg,
+            "freq": self.freq_seconds,
+            "actuator_cfg": self.actuator_cfg,
+            "actuator_freq": self.actuator_freq,
+        })
+
+    def stop_modbus_scan_worker(self):
+        if hasattr(self, "scan_worker") and self.scan_worker:
+            self.scan_stop_requested.emit()
+
+        if hasattr(self, "scan_thread") and self.scan_thread:
+            self.scan_thread.quit()
+            self.scan_thread.wait(3000)
+
+        self.scan_worker = None
+        self.scan_thread = None
+
+    def on_sensor_data_ready(self, result_dict):
+        self.update_realtime_display(result_dict)
+
+        output_json = {
+            "type": "data",
+            "device_sn": self.mqtt.device_sn,
+            "timestamp": int(time.time()),
+            "data": result_dict,
+        }
+
+        publish_topic = (
+            f"tenants/{self.mqtt_tenant_id_input.text().strip()}"
+            f"/devices/{self.mqtt.device_sn}/telemetry"
+        )
+
+        if not self.pause_mqtt_publish:
+            self.mqtt.publish(publish_topic, json.dumps(output_json), qos=1)
+        else:
+            self.current_output = output_json
+
+        self.status_message_label.setText(f"Read and published {len(result_dict)} tags")
+
+
+    def on_actuator_status_ready(self, current_states, changed):
+        self.last_actuator_states = current_states.copy()
+        self.update_realtime_display(None)
+
+        if changed and current_states:
+            output_json = {
+                "type": "action",
+                "device_sn": self.mqtt.device_sn,
+                "timestamp": int(time.time()),
+                "action": "actuator_status",
+                "data": current_states,
+            }
+
+            publish_topic = (
+                f"tenants/{self.mqtt_tenant_id_input.text().strip()}"
+                f"/devices/{self.mqtt.device_sn}/telemetry"
+            )
+
+            if not self.pause_mqtt_publish:
+                self.mqtt.publish(publish_topic, json.dumps(output_json), qos=1)
+                self.status_message_label.setText(f"Actuator 状态变化已上报 | {len(current_states)} 个")
+            else:
+                self.current_output = output_json
+
+
+    def on_action_result_ready(self, result):
+        device_id = result.get("device_id")
+        states = result.get("states")
+
+        if device_id and states is not None:
+            self.last_actuator_states[device_id] = states
+            self.relay_status = states[:self.coil_count_spin.value()]
+            self.update_coils_display()
+            self.update_realtime_display(None)
+
+            output_json = {
+                "type": "action",
+                "device_sn": self.mqtt.device_sn,
+                "timestamp": int(time.time()),
+                "action": "actuator_status",
+                "data": {
+                    device_id: states
+                }
+            }
+
+            publish_topic = (
+                f"tenants/{self.mqtt_tenant_id_input.text().strip()}"
+                f"/devices/{self.mqtt.device_sn}/telemetry"
+            )
+
+            if not self.pause_mqtt_publish:
+                self.mqtt.publish(publish_topic, json.dumps(output_json), qos=0)
+
+        self.status_message_label.setText(result.get("message", "Action finished"))
+
+
+    def on_scan_worker_error(self, msg):
+        print(msg)
+        self.status_message_label.setText(msg)
+
+    def closeEvent(self, event):
+        try:
+             self.stop_modbus_scan_worker()
+
+             if self.client and self.client.connected:
+                 self.client.close()
+                 self.client = None
+
+        except Exception as e:
+            print(f"DEBUG closeEvent cleanup failed: {e}")
+
+        event.accept()
+
+    def emit_scan_config_to_worker(self):
+        """把当前扫描配置同步给 ModbusScanWorker"""
+        if hasattr(self, "scan_worker") and self.scan_worker:
+            print(
+                "DEBUG emit_scan_config_to_worker:",
+                "freq", self.freq_seconds,
+                "actuator_freq", self.actuator_freq,
+                "cfg", len(self.current_cfg),
+                "actuator_cfg", len(self.actuator_cfg),
+            )
+
+            self.scan_config_updated.emit({
+                "cfg": self.current_cfg,
+                "freq": self.freq_seconds,
+                "actuator_cfg": self.actuator_cfg,
+                "actuator_freq": self.actuator_freq,
+            })
