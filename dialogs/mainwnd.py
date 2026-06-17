@@ -24,6 +24,7 @@ class MainWindow(QMainWindow):
     scan_config_updated = pyqtSignal(dict)
     scan_action_requested = pyqtSignal(dict)
     scan_stop_requested = pyqtSignal()
+    relay_command_requested = pyqtSignal(dict)
 
     def __init__(self):
         super(MainWindow, self).__init__()
@@ -923,6 +924,8 @@ class MainWindow(QMainWindow):
                 child.widget().deleteLater()
 
         count = self.coil_count_spin.value()
+
+        self.relay_toggle_buttons = {}
         
         for i in range(count):
             container = QWidget()
@@ -936,6 +939,8 @@ class MainWindow(QMainWindow):
             label.setStyleSheet("font-size: 20px; font-weight: bold;")
             
             toggle = ToggleToolButton()
+
+            self.relay_toggle_buttons[i] = toggle
             
             # ================= 🛠️ 核心修复：在这里加锁 =================
             toggle.blockSignals(True)  # 1. 临时屏蔽信号，防止 setChecked 触发 toggled 信号
@@ -956,17 +961,30 @@ class MainWindow(QMainWindow):
         self.coils_status_layout.addStretch(1)
 
     def on_coil_toggle(self, channel: int, checked: bool):
-        """点击 Toggle 直接控制对应线圈"""
+        """点击 Toggle 后，将手动继电器控制交给 worker thread 执行"""
         if not self.client or not self.client.connected:
             QMessageBox.warning(self, "警告", "串口未打开")
             return
-            
-        success = self.client.write_single_coil(channel, checked)
-        if success:
-            self.relay_status[channel] = checked
-            self.status_message_label.setText(f"CH{channel} 已设置为 {'ON' if checked else 'OFF'}")
-        else:
-            QMessageBox.warning(self, "失败", f"控制 CH{channel} 失败")
+
+        if not hasattr(self, "scan_worker") or not self.scan_worker:
+            QMessageBox.warning(self, "警告", "扫描线程未启动")
+            return
+
+        old_state = self.relay_status[channel] if channel < len(self.relay_status) else False
+
+        # Optimistic UI: 先立刻更新界面，失败后再回滚
+        if channel < len(self.relay_status):
+            self.set_relay_ui_state(channel, checked)
+
+        self.status_message_label.setText(
+            f"正在设置 CH{channel} 为 {'ON' if checked else 'OFF'}..."
+        )
+
+        self.relay_command_requested.emit({
+            "channel": channel,
+            "checked": checked,
+            "old_state": old_state,
+        })
 
     def read_coils_status(self):
         """读取线圈输出状态 (功能码 01)"""
@@ -1548,42 +1566,77 @@ class MainWindow(QMainWindow):
         """打开指定继电器通道"""
         if not self._check_client_ready():
             return
+
+        if not hasattr(self, "scan_worker") or not self.scan_worker:
+            QMessageBox.warning(self, "警告", "扫描线程未启动")
+            return
+
         ch = self.relay_channel_spin.value()
-        success = self.client.write_single_coil(ch, True)
-        if success:
-            self.relay_status[ch] = True
-            self.status_message_label.setText(f"继电器 CH{ch} 已打开 (ON)")
-            self.update_coils_display()   # 刷新显示
-        else:
-            QMessageBox.warning(self, "失败", f"打开继电器 CH{ch} 失败")
+        old_state = self.relay_status[ch] if ch < len(self.relay_status) else False
+
+        # Optimistic UI: 先立刻显示 ON，失败后再回滚
+        if ch < len(self.relay_status):
+            self.set_relay_ui_state(ch, True)
+
+        self.status_message_label.setText(f"正在打开继电器 CH{ch}...")
+
+        self.relay_command_requested.emit({
+            "channel": ch,
+            "checked": True,
+            "old_state": old_state,
+        })
 
     def relay_turn_off(self):
         """关闭指定继电器通道"""
         if not self._check_client_ready():
             return
+
+        if not hasattr(self, "scan_worker") or not self.scan_worker:
+            QMessageBox.warning(self, "警告", "扫描线程未启动")
+            return
+
         ch = self.relay_channel_spin.value()
-        success = self.client.write_single_coil(ch, False)
-        if success:
-            self.relay_status[ch] = False
-            self.status_message_label.setText(f"继电器 CH{ch} 已关闭 (OFF)")
-            self.update_coils_display()
-        else:
-            QMessageBox.warning(self, "失败", f"关闭继电器 CH{ch} 失败")
+        old_state = self.relay_status[ch] if ch < len(self.relay_status) else False
+
+        # Optimistic UI: 先立刻显示 OFF，失败后再回滚
+        if ch < len(self.relay_status):
+            self.set_relay_ui_state(ch, False)
+
+        self.status_message_label.setText(f"正在关闭继电器 CH{ch}...")
+
+        self.relay_command_requested.emit({
+            "channel": ch,
+            "checked": False,
+            "old_state": old_state,
+        })
 
     def relay_toggle(self):
         """翻转指定继电器通道"""
         if not self._check_client_ready():
             return
+
+        if not hasattr(self, "scan_worker") or not self.scan_worker:
+            QMessageBox.warning(self, "警告", "扫描线程未启动")
+            return
+
         ch = self.relay_channel_spin.value()
-        # 当前状态取反
-        new_state = not self.relay_status[ch] if ch < len(self.relay_status) else True
-        success = self.client.write_single_coil(ch, new_state)
-        if success:
-            self.relay_status[ch] = new_state
-            self.status_message_label.setText(f"继电器 CH{ch} 已翻转 → {'ON' if new_state else 'OFF'}")
-            self.update_coils_display()
-        else:
-            QMessageBox.warning(self, "失败", f"翻转继电器 CH{ch} 失败")
+
+        old_state = self.relay_status[ch] if ch < len(self.relay_status) else False
+        new_state = not old_state
+
+        # Optimistic UI: 先立刻翻转显示，失败后再回滚
+        if ch < len(self.relay_status):
+            self.set_relay_ui_state(ch, new_state)
+
+        self.status_message_label.setText(
+            f"正在翻转继电器 CH{ch} → {'ON' if new_state else 'OFF'}..."
+        )
+
+        self.relay_command_requested.emit({
+            "channel": ch,
+            "checked": new_state,
+            "old_state": old_state,
+        })
 
     def relay_flash(self):
         """闪开（延时断开）"""
@@ -1674,26 +1727,18 @@ class MainWindow(QMainWindow):
 
         self.scan_thread.started.connect(self.scan_worker.start_loop)
 
-        self.scan_config_updated.connect(
-            self.scan_worker.update_config,
-            Qt.DirectConnection
-        )
-
-        self.scan_action_requested.connect(
-            self.scan_worker.enqueue_action,
-            Qt.DirectConnection
-        )
-
-        self.scan_stop_requested.connect(
-            self.scan_worker.stop_loop,
-            Qt.DirectConnection
-        )
+        self.scan_config_updated.connect(self.scan_worker.update_config)
+        self.scan_action_requested.connect(self.scan_worker.enqueue_action)
+        self.scan_stop_requested.connect(self.scan_worker.stop_loop)
 
         self.scan_worker.sensor_data_ready.connect(self.on_sensor_data_ready)
         self.scan_worker.actuator_status_ready.connect(self.on_actuator_status_ready)
         self.scan_worker.action_result_ready.connect(self.on_action_result_ready)
         self.scan_worker.status_message.connect(self.status_message_label.setText)
         self.scan_worker.error_occurred.connect(self.on_scan_worker_error)
+
+        self.relay_command_requested.connect(self.scan_worker.execute_relay_command)
+        self.scan_worker.relay_command_finished.connect(self.on_relay_command_finished)
 
         self.scan_thread.start()
 
@@ -1807,24 +1852,56 @@ class MainWindow(QMainWindow):
                  self.client = None
 
         except Exception as e:
-            print(f"DEBUG closeEvent cleanup failed: {e}")
+            print(f"closeEvent cleanup failed: {e}")
 
         event.accept()
 
     def emit_scan_config_to_worker(self):
         """把当前扫描配置同步给 ModbusScanWorker"""
         if hasattr(self, "scan_worker") and self.scan_worker:
-            print(
-                "DEBUG emit_scan_config_to_worker:",
-                "freq", self.freq_seconds,
-                "actuator_freq", self.actuator_freq,
-                "cfg", len(self.current_cfg),
-                "actuator_cfg", len(self.actuator_cfg),
-            )
-
             self.scan_config_updated.emit({
                 "cfg": self.current_cfg,
                 "freq": self.freq_seconds,
                 "actuator_cfg": self.actuator_cfg,
                 "actuator_freq": self.actuator_freq,
             })
+
+    def on_relay_command_finished(self, result: dict):
+        channel = result.get("channel", 0)
+        checked = result.get("checked", False)
+        old_state = result.get("old_state", False)
+        success = result.get("success", False)
+
+        if success:
+            self.set_relay_ui_state(channel, checked)
+
+            self.status_message_label.setText(
+                f"CH{channel} 已设置为 {'ON' if checked else 'OFF'}"
+            )
+        else:
+            # 失败则恢复旧显示状态
+            self.set_relay_ui_state(channel, old_state)
+
+            error = result.get("error", "")
+            message = f"控制 CH{channel} 失败，已恢复显示状态"
+            if error:
+                message += f"\n\n错误信息: {error}"
+
+            self.status_message_label.setText(message)
+
+            QMessageBox.warning(
+                self,
+                "继电器控制失败",
+                message
+            )
+
+    def set_relay_ui_state(self, channel: int, state: bool):
+        """同步更新 relay_status 和对应 Toggle UI，不触发新的 Modbus 控制"""
+        if channel < len(self.relay_status):
+            self.relay_status[channel] = state
+
+        if hasattr(self, "relay_toggle_buttons") and channel in self.relay_toggle_buttons:
+            toggle = self.relay_toggle_buttons[channel]
+            toggle.blockSignals(True)
+            toggle.setChecked(state)
+            toggle.blockSignals(False)
