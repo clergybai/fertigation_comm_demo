@@ -1,7 +1,7 @@
 {
   "cfg": [
     {
-      "id": "e83cd5af-6367-49f7-b3bc-73292234b689",
+      "id": "896d8519-d8b7-4b21-903c-1eb547cc7c85",
       "tag_code": "air_humidity",
       "slave_id": 1,
       "reg_address": 0,
@@ -10,7 +10,7 @@
       "scale": 0.1
     },
     {
-      "id": "70842311-a7dd-44c2-aeda-d4ad7c928c83",
+      "id": "b10f18aa-0d67-4f60-adeb-2b818fd5e48a",
       "tag_code": "air_temperature",
       "slave_id": 1,
       "reg_address": 1,
@@ -22,9 +22,27 @@
   "freq": 10,
   "actuator_cfg": [
     {
-      "id": "1a99a80f-6e42-4a11-a6d7-6f6dadf47a3a",
+      "id": "21a4a6ca-e14c-4796-abba-a7836db20c6e",
+      "slave_id": 111,
+      "reg_address": 1,
+      "actuator_type": "ANALOG_MODULE",
+      "analog_min": 0,
+      "analog_max": 100,
+      "prerequisite_coil_id": "3fff642d-7b67-4c97-a6c3-582c44a82f85",
+      "prerequisite_required_state": true,
+      "prerequisite": {
+        "device_id": "e510b8e3-f28f-4284-812f-e5def07b7522",
+        "slave_id": 101,
+        "reg_address": 0,
+        "coil_address": 0,
+        "required_state": true
+      }
+    },
+    {
+      "id": "e510b8e3-f28f-4284-812f-e5def07b7522",
       "slave_id": 101,
       "reg_address": 0,
+      "actuator_type": "RELAY_MODULE",
       "coil_count": 8
     }
   ],

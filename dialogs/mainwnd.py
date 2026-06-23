@@ -1145,42 +1145,84 @@ class MainWindow(QMainWindow):
             print(f"Error processing MQTT message: {e}")
 
     def handle_action_message(self, data):
+        control_mode = data.get("control_mode", "BINARY")
         action_data = data.get("data")
-        slave_id = action_data.get("slave_id", 100)
-        address = action_data.get("coil_ch", 0)
-        val = action_data.get("val", False)
-        device_id = action_data.get("device_id")
-        coil_address = action_data.get("coil_address")
-        coil_count = action_data.get("coil_count")
+        if control_mode == "BINARY":
+            slave_id = action_data.get("slave_id", 100)
+            address = action_data.get("coil_ch", 0)
+            val = action_data.get("val", False)
+            device_id = action_data.get("device_id")
+            coil_address = action_data.get("coil_address")
+            coil_count = action_data.get("coil_count")
+                    
+            if not self.check_acutator_status_equal_by_ch(device_id=device_id,ch=address,val=val):
+                        # 发给继电器
+                self.client.write_single_coil_with_slaveid(
+                            slave_id=slave_id,
+                            address=address,
+                            value=val
+                        )
+                # 返回device的actuator的状态
+                self.last_actuator_states[device_id] = self.client.read_coils(
+                            start_addr=coil_address, count=coil_count, slave_id=slave_id)
                 
-        if not self.check_acutator_status_equal_by_ch(device_id=device_id,ch=address,val=val):
-                    # 发给继电器
-            self.client.write_single_coil_with_slaveid(
-                        slave_id=slave_id,
-                        address=address,
-                        value=val
-                    )
-            # 返回device的actuator的状态
-            self.last_actuator_states[device_id] = self.client.read_coils(
-                        start_addr=coil_address, count=coil_count, slave_id=slave_id)
-            
-            self.relay_status = self.last_actuator_states[device_id][:self.coil_count_spin.value()]
-            self.update_coils_display()
-            
-            current_states = {}
-            current_states[device_id] = self.last_actuator_states[device_id]
-            output_json = {
-                "type": "action",
-                "device_sn": self.mqtt.device_sn,
-                "timestamp": int(time.time()),
-                "action": "actuator_status",
-                "data": current_states
-            }
-            publish_topic = f"tenants/{self.mqtt_tenant_id_input.text().strip()}/devices/{self.mqtt.device_sn}/telemetry"
-            self.mqtt.publish(publish_topic, json.dumps(output_json), qos=0)
-        # 通过telemetry返回
-        # TODO: 设计传回temetry的数据结构 传回actuator的执行结果。
-        pass
+                self.relay_status = self.last_actuator_states[device_id][:self.coil_count_spin.value()]
+                self.update_coils_display()
+                
+                current_states = {}
+                current_states[device_id] = self.last_actuator_states[device_id]
+                output_json = {
+                    "type": "action",
+                    "device_sn": self.mqtt.device_sn,
+                    "timestamp": int(time.time()),
+                    "control_mode": control_mode,
+                    "action": "actuator_status",
+                    "data": current_states
+                }
+                publish_topic = f"tenants/{self.mqtt_tenant_id_input.text().strip()}/devices/{self.mqtt.device_sn}/telemetry"
+                self.mqtt.publish(publish_topic, json.dumps(output_json), qos=0)
+        elif control_mode == "ANALOG":
+                # 这个是控制模拟信号的action
+                # 首先检查这个有没有前置限制条件，如果有，看看前置条件是否满足
+                # 满足前置条件或者没有前置条件则继续进行。
+                if "prerequisite" in action_data:
+                    # 检查到前置条件，那么去找前置条件是否满足
+                    prerequisite = action_data.get("prerequisite")
+                    # 找到
+                    prerequsite_device_id = prerequisite.get("device_id")
+                    # 使用这个prerequsite_device_id 去找紫铜中保存的该device的继电器状态
+                    device_states = self.last_actuator_states[prerequsite_device_id]
+                    # 获取通路蚕食
+                    channel = prerequisite.get("coil_ch")
+                    
+                    current_state = device_states[channel]
+                    required_state = prerequisite.get("required_state")
+                    
+                    if current_state != required_state:
+                        # 不满足前置条件，直接退出
+                        return
+                    # 满足条件以后，写保持寄存器
+                slave_id = action_data.get("slave_id", 100)
+                address = action_data.get("reg_address")
+                val = action_data.get("val", 0)
+                if self.client.write_single_holding_register(address=address, value=val, slave_id=slave_id):
+                    # 更新last_actuator_states
+                    self.last_actuator_states[device_id] = val
+                else:
+                    return
+                current_states = {}
+                current_states[device_id] = self.last_actuator_states[device_id]
+                output_json = {
+                    "type": "action",
+                    "device_sn": self.mqtt.device_sn,
+                    "timestamp": int(time.time()),
+                    "control_mode": control_mode,
+                    "action": "actuator_status",
+                    "data": current_states
+                }
+                publish_topic = f"tenants/{self.mqtt_tenant_id_input.text().strip()}/devices/{self.mqtt.device_sn}/telemetry"
+                self.mqtt.publish(publish_topic, json.dumps(output_json), qos=0)
+                
 
     def handle_config_message(self, data):
         updated = False
@@ -1300,25 +1342,28 @@ class MainWindow(QMainWindow):
         
         for item in self.actuator_cfg:
             try:
-                device_id = item.get('id')
-                slave_id = item.get("slave_id", 1)
-                reg_address = item.get("reg_address", 0)
-                coil_count = item.get("coil_count", 8)
-                # 这里调用client读取 离散状态 02功能码
-                states = self.client.read_coils(
-                    start_addr=reg_address,
-                    count=coil_count,
-                    slave_id=slave_id
-                )
-                if states is not None:
-                    current_states[device_id] = states
-                    
-                    last_states = self.last_actuator_states.get(device_id)
-                    if last_states != states:
-                        changed = True
-                        print(f"Actuator {device_id} 状态变化: {last_states} -> {states}")
+                if "actuator_type" in item and item["actuator_type"] == "ANALOG_MODULE":
+                    continue  # 跳过模拟量模块的状态读取
                 else:
-                    print(f"读取离散输入失败: {device_id}")
+                    device_id = item.get('id')
+                    slave_id = item.get("slave_id", 1)
+                    reg_address = item.get("reg_address", 0)
+                    coil_count = item.get("coil_count", 8)
+                    # 这里调用client读取 离散状态 02功能码
+                    states = self.client.read_coils(
+                        start_addr=reg_address,
+                        count=coil_count,
+                        slave_id=slave_id
+                    )
+                    if states is not None:
+                        current_states[device_id] = states
+                        
+                        last_states = self.last_actuator_states.get(device_id)
+                        if last_states != states:
+                            changed = True
+                            print(f"Actuator {device_id} 状态变化: {last_states} -> {states}")
+                    else:
+                        print(f"读取离散输入失败: {device_id}")
                     
             except Exception as e:
                 print(f"读取 actuator {device_id} 失败: {e}")

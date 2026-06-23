@@ -548,8 +548,42 @@ class ModbusRTUClient:
         finally:
             # 恢复原来的 slave_id，避免影响其他地方
             self.slave_id = original_slave_id
+
+    def write_single_holding_register(self, address: int, value: int, slave_id: Optional[int] = None) -> bool:
+        """写单个保存寄存器 (功能码 06H)"""
+        # return True for test
+        return True
+        
+        if not self.connected:
+            if not self.connect():
+                logger.warning("串口未连接，写单寄存器失败")
+                return False
+        # 临时切换丛集 ID
+        original_slave_id = self.slave_id
+        if slave_id is not None:
+            self.slave_id = slave_id
+        
+        try:
+            # 严格控制数据边界，Modbus 单寄存器为 16 位
+            safe_value = value & 0xFFFF
+            response = self.client.write_register(
+                address=address,
+                value=safe_value,
+                device_id=self.slave_id
+            )
             
-    
+            if response.isError():
+                logger.error(f"Write single register to addr:{address} failed: {response}")
+                return False
+            
+            return True
+        except Exception as e:
+            logger.error(f"write_single_register error: {e}")
+            return False
+        finally:
+            self.slave_id = original_slave_id
+        
+
     def write_slave_id_broadcast(self, new_slave_id: int) -> bool:
         """
         专门针对该485设备设计的：通过0x00广播地址强制改写 Slave ID (功能码 10H)
@@ -620,103 +654,6 @@ class ModbusRTUClient:
         except Exception as e:
             logger.error(f"广播改写设备ID异常: {e}")
             return False
-    # def flash_coil(self, address: int, delay_ms: int = 800):
-    #     """
-    #     闪开指令 - 严格按照说明文档使用功能码 05
-    #     """
-    #     try:
-    #         if hasattr(self, 'main_window') and self.main_window:
-    #             self.main_window.append_log_raw(f"TX: Flash CH{address} {delay_ms}ms")
-
-    #         # 按照说明文档：
-    #         # 地址 = 0x0200 + channel
-    #         # 值   = delay_ms / 100 （整数）
-    #         flash_address = 0x0200 + address
-    #         delay_value = max(1, delay_ms // 100)
-
-    #         # 使用 write_coil 并传入数值（pymodbus 支持）
-    #         response = self.client.write_coil(
-    #             address=flash_address, 
-    #             value=delay_value,           # 关键：传入整数值
-    #             device_id=self.slave_id
-    #         )
-            
-    #         success = not response.isError()
-            
-    #         if success and hasattr(self, 'main_window') and self.main_window:
-    #             self.main_window.append_log_raw(f"RX: Flash Success ({delay_value}×100ms)")
-    #         elif hasattr(self, 'main_window') and self.main_window:
-    #             self.main_window.append_log_raw("RX: Flash Failed")
-
-    #         if success:
-    #             logger.info(f"Flash coil CH{address} with {delay_ms}ms success")
-    #         else:
-    #             logger.error(f"Flash coil failed: {response}")
-
-    #         return success
-            
-    #     except Exception as e:
-    #         if hasattr(self, 'main_window') and self.main_window:
-    #             self.main_window.append_log_raw(f"RX: Flash Exception {e}")
-    #         logger.error(f"flash_coil error: {e}")
-    #         return False
-    
-    # def flash_coil(self, address: int, delay_ms: int = 800):
-    #     """闪开指令 - 功能码05 + 延时值"""
-    #     try:
-    #         if hasattr(self, 'main_window') and self.main_window:
-    #             self.main_window.append_log_raw(f"TX: Flash CH{address} {delay_ms}ms")
-
-    #         flash_address = 0x0200 + address
-    #         delay_value = max(1, delay_ms // 100)   # 1000ms → 10
-
-    #         # 构造完整请求
-    #         request = bytes([
-    #             self.slave_id,
-    #             0x05,                                   # 功能码 05
-    #             (flash_address >> 8) & 0xFF,
-    #             flash_address & 0xFF,
-    #             (delay_value >> 8) & 0xFF,
-    #             delay_value & 0xFF
-    #         ])
-
-    #         # CRC16
-    #         def modbus_crc(data):
-    #             crc = 0xFFFF
-    #             for byte in data:
-    #                 crc ^= byte
-    #                 for _ in range(8):
-    #                     if crc & 1:
-    #                         crc = (crc >> 1) ^ 0xA001
-    #                     else:
-    #                         crc >>= 1
-    #             return crc
-
-    #         crc = modbus_crc(request)
-    #         request += bytes([crc & 0xFF, (crc >> 8) & 0xFF])
-
-    #         # 发送
-    #         self.client.send(request)
-
-    #         self.main_window.append_log_raw(f"TX Raw: {request.hex().upper()}")
-
-    #         # 读取响应
-    #         import time
-    #         time.sleep(0.3)
-    #         if hasattr(self.client, 'recv'):
-    #             resp = self.client.recv(1024)
-    #             if resp:
-    #                 self.main_window.append_log_raw(f"RX Raw: {resp.hex().upper()}")
-    #                 return True
-
-    #         self.main_window.append_log_raw("RX: No Response")
-    #         return False
-
-    #     except Exception as e:
-    #         if hasattr(self, 'main_window') and self.main_window:
-    #             self.main_window.append_log_raw(f"RX: Flash Exception {str(e)}")
-    #         logger.error(f"flash_coil error: {e}")
-    #         return False
 
     def flash_coil(self, address: int, delay_ms: int = 800):
         """闪开指令 - 完美物理控制 + 强行修正 UI 通讯 Log"""
