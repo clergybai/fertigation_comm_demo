@@ -115,6 +115,7 @@ class ModbusScanWorker(QObject):
     @pyqtSlot(dict)
     def enqueue_action(self, action_data: dict):
         """MQTT action：在 worker thread 中执行一次 Modbus action"""
+        breakpoint()
         self._execute_action(action_data)
 
     def _scan_sensor_once(self, cfg_list):
@@ -254,6 +255,7 @@ class ModbusScanWorker(QObject):
                 return
 
             if control_mode == "ANALOG":
+                breakpoint()
                 prerequisite = action_data.get("prerequisite")
                 if prerequisite:
                     prerequisite_device_id = prerequisite.get("device_id")
