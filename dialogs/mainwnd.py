@@ -4,7 +4,7 @@ import json
 from PyQt5 import QtWidgets
 from PyQt5.QtWidgets import QAction, QApplication, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QMainWindow, QMenu, QMessageBox, QPushButton, QScrollArea, QSpinBox, QStatusBar, QTextEdit, QVBoxLayout, QWidget, QLineEdit
 from modbus.modbus_rtu import AsyncModbusRTUClient, ModbusRTUClient
-from PyQt5.QtCore import QTimer, Qt
+from PyQt5.QtCore import QTimer, Qt, QThread, pyqtSignal
 import serial.tools.list_ports
 from widgets.combobox import BaudrateComboBox, ConverterComboBox, DataBitsComboBox, ParityComboBox, StopBitsComboBox
 from widgets.actuator_status_widget import ActuatorStatusWidget
@@ -15,12 +15,17 @@ from widgets.spinbox import SlaveIdSpinBox
 from common.mqtt import MqttClient
 from PyQt5.QtCore import QSettings
 import os
+from modbus.modbus_scan_worker import ModbusScanWorker
 
 from widgets.toggle_button import ToggleToolButton
 
 
 class MainWindow(QMainWindow):
-    
+    scan_config_updated = pyqtSignal(dict)
+    scan_action_requested = pyqtSignal(dict)
+    scan_stop_requested = pyqtSignal()
+    relay_command_requested = pyqtSignal(dict)
+
     def __init__(self):
         super(MainWindow, self).__init__()
         self.setWindowTitle("Modbus RTU Client Tool")
@@ -41,10 +46,10 @@ class MainWindow(QMainWindow):
         # last_actuator_states record last discrete status
         self.last_actuator_states = {}
         self.read_timer = QTimer()
-        self.read_timer.timeout.connect(self.read_modbus_by_cfg)
+        #self.read_timer.timeout.connect(self.read_modbus_by_cfg)
         
         self.actuator_read_timer = QTimer()
-        self.actuator_read_timer.timeout.connect(self.read_actuators_by_cfg)
+        #self.actuator_read_timer.timeout.connect(self.read_actuators_by_cfg)
         
         self.current_output = None
         self.pause_mqtt_publish = False
@@ -693,8 +698,7 @@ class MainWindow(QMainWindow):
             self.current_cfg = data.get("cfg", {})
             self.freq_seconds = data.get("freq", 300)
             self.actuator_cfg = data.get("actuator_cfg", [])
-            self.actuator_freq = data.get("actuator_freq", 300)
-            
+            self.actuator_freq = data.get("actuator_freq", 10)
             try:
                 if hasattr(self, 'actuator_freq_input'):
                     self.actuator_freq_input.setValue(self.actuator_freq)
@@ -740,6 +744,9 @@ class MainWindow(QMainWindow):
             return
         
         if self.client and self.client.connected:
+            # 先停止扫描线程，避免 worker 继续使用已经关闭的 serial client
+            self.stop_modbus_scan_worker()
+
             self.client.close()
             self.client = None
 
@@ -757,13 +764,23 @@ class MainWindow(QMainWindow):
                 stopbits=self.stopbits_combo.get_current_stop_bits(),
                 slave_id=self.slave_id_spinbox.get_slave_id(),
                 timeout=1,
-                main_window=self)
+                main_window=None)
             
+            self.client.log_emitter.raw_log.connect(self.append_log_raw)
             self.client.set_log_enabled(self.log_visible)
 
             if self.client.connect():
                 self.confirm_btn.setText("Close Serial Port")
                 self.status_message_label.setText(f"串口 {self.selected_port} 已打开")
+
+                self.start_modbus_scan_worker()
+
+                self.scan_config_updated.emit({
+                    "cfg": self.current_cfg,
+                    "freq": self.freq_seconds,
+                    "actuator_cfg": self.actuator_cfg,
+                    "actuator_freq": self.actuator_freq,
+                    })
                 
                 # 如果已经有配置，则启动定时读取
                 # if self.current_cfg and self.freq_seconds > 0:
@@ -907,6 +924,8 @@ class MainWindow(QMainWindow):
                 child.widget().deleteLater()
 
         count = self.coil_count_spin.value()
+
+        self.relay_toggle_buttons = {}
         
         for i in range(count):
             container = QWidget()
@@ -920,6 +939,8 @@ class MainWindow(QMainWindow):
             label.setStyleSheet("font-size: 20px; font-weight: bold;")
             
             toggle = ToggleToolButton()
+
+            self.relay_toggle_buttons[i] = toggle
             
             # ================= 🛠️ 核心修复：在这里加锁 =================
             toggle.blockSignals(True)  # 1. 临时屏蔽信号，防止 setChecked 触发 toggled 信号
@@ -940,17 +961,30 @@ class MainWindow(QMainWindow):
         self.coils_status_layout.addStretch(1)
 
     def on_coil_toggle(self, channel: int, checked: bool):
-        """点击 Toggle 直接控制对应线圈"""
+        """点击 Toggle 后，将手动继电器控制交给 worker thread 执行"""
         if not self.client or not self.client.connected:
             QMessageBox.warning(self, "警告", "串口未打开")
             return
-            
-        success = self.client.write_single_coil(channel, checked)
-        if success:
-            self.relay_status[channel] = checked
-            self.status_message_label.setText(f"CH{channel} 已设置为 {'ON' if checked else 'OFF'}")
-        else:
-            QMessageBox.warning(self, "失败", f"控制 CH{channel} 失败")
+
+        if not hasattr(self, "scan_worker") or not self.scan_worker:
+            QMessageBox.warning(self, "警告", "扫描线程未启动")
+            return
+
+        old_state = self.relay_status[channel] if channel < len(self.relay_status) else False
+
+        # Optimistic UI: 先立刻更新界面，失败后再回滚
+        if channel < len(self.relay_status):
+            self.set_relay_ui_state(channel, checked)
+
+        self.status_message_label.setText(
+            f"正在设置 CH{channel} 为 {'ON' if checked else 'OFF'}..."
+        )
+
+        self.relay_command_requested.emit({
+            "channel": channel,
+            "checked": checked,
+            "old_state": old_state,
+        })
 
     def read_coils_status(self):
         """读取线圈输出状态 (功能码 01)"""
@@ -964,7 +998,6 @@ class MainWindow(QMainWindow):
         try:
             # 功能码 01：读取线圈状态
             response = self.client.read_coils(start_addr=0, count=count)
-            
             if response is not None:
                 self.relay_status = response[:count]  # 更新缓存
                 self.update_coils_display()
@@ -1053,38 +1086,29 @@ class MainWindow(QMainWindow):
     def on_freq_changed(self, new_freq: int):
         """用户手动修改读取频率时实时生效"""
         self.freq_seconds = new_freq
-        
-        # 只有当串口已经打开时才启动定时器
+
+        # 旧逻辑：不再启动 GUI 主线程 read_timer
+        # 新逻辑：通知 worker 使用新频率
+        self.emit_scan_config_to_worker()
+
         if self.client and self.client.connected:
-            if self.read_timer.isActive():
-                self.read_timer.stop()
-            if new_freq > 0:
-                self.read_timer.start(new_freq * 1000)
-                self.status_message_label.setText(f"读取频率已修改为: {new_freq} 秒")
+            self.status_message_label.setText(f"读取频率已修改为: {new_freq} 秒")
         else:
             self.status_message_label.setText(f"频率已设置为 {new_freq} 秒（串口未打开，暂不启动读取）")
-        
-        # 保存到配置文件
+
         self.save_current_cfg()
         
     def on_actuator_freq_changed(self, new_freq: int):
-        """用户手动修改执行器频率时实时生效"""
+        """用户手动修改 actuator 读取频率时实时生效"""
         self.actuator_freq = new_freq
 
+        self.emit_scan_config_to_worker()
+
         if self.client and self.client.connected:
-            if self.actuator_read_timer.isActive():
-                self.actuator_read_timer.stop
-            
-            if new_freq > 0:
-                self.actuator_read_timer.start(new_freq * 1000)
-                self.status_message_label.setText(
-                    f"执行器频率已修改为:{new_freq}秒"
-                )
-            else:
-                self.status_message_label.setText(
-                    f"执行器频率已修改为:{new_freq}秒（串口未打开，暂不启动读取）"
-                )
-        # 保存配置
+            self.status_message_label.setText(f"Actuator 读取频率已修改为: {new_freq} 秒")
+        else:
+            self.status_message_label.setText(f"Actuator 频率已设置为 {new_freq} 秒（串口未打开，暂不启动读取）")
+
         self.save_current_cfg()
 
     # 信号槽
@@ -1147,82 +1171,18 @@ class MainWindow(QMainWindow):
     def handle_action_message(self, data):
         control_mode = data.get("control_mode", "BINARY")
         action_data = data.get("data")
-        if control_mode == "BINARY":
-            slave_id = action_data.get("slave_id", 100)
-            address = action_data.get("coil_ch", 0)
-            val = action_data.get("val", False)
-            device_id = action_data.get("device_id")
-            coil_address = action_data.get("coil_address")
-            coil_count = action_data.get("coil_count")
-                    
-            if not self.check_acutator_status_equal_by_ch(device_id=device_id,ch=address,val=val):
-                        # 发给继电器
-                self.client.write_single_coil_with_slaveid(
-                            slave_id=slave_id,
-                            address=address,
-                            value=val
-                        )
-                # 返回device的actuator的状态
-                self.last_actuator_states[device_id] = self.client.read_coils(
-                            start_addr=coil_address, count=coil_count, slave_id=slave_id)
-                
-                self.relay_status = self.last_actuator_states[device_id][:self.coil_count_spin.value()]
-                self.update_coils_display()
-                
-                current_states = {}
-                current_states[device_id] = self.last_actuator_states[device_id]
-                output_json = {
-                    "type": "action",
-                    "device_sn": self.mqtt.device_sn,
-                    "timestamp": int(time.time()),
-                    "control_mode": control_mode,
-                    "action": "actuator_status",
-                    "data": current_states
-                }
-                publish_topic = f"tenants/{self.mqtt_tenant_id_input.text().strip()}/devices/{self.mqtt.device_sn}/telemetry"
-                self.mqtt.publish(publish_topic, json.dumps(output_json), qos=0)
-        elif control_mode == "ANALOG":
-                # 这个是控制模拟信号的action
-                # 首先检查这个有没有前置限制条件，如果有，看看前置条件是否满足
-                # 满足前置条件或者没有前置条件则继续进行。
-                if "prerequisite" in action_data:
-                    # 检查到前置条件，那么去找前置条件是否满足
-                    prerequisite = action_data.get("prerequisite")
-                    # 找到
-                    prerequsite_device_id = prerequisite.get("device_id")
-                    # 使用这个prerequsite_device_id 去找紫铜中保存的该device的继电器状态
-                    device_states = self.last_actuator_states[prerequsite_device_id]
-                    # 获取通路蚕食
-                    channel = prerequisite.get("coil_ch")
-                    
-                    current_state = device_states[channel]
-                    required_state = prerequisite.get("required_state")
-                    
-                    if current_state != required_state:
-                        # 不满足前置条件，直接退出
-                        return
-                    # 满足条件以后，写保持寄存器
-                slave_id = action_data.get("slave_id", 100)
-                address = action_data.get("reg_address")
-                val = action_data.get("val", 0)
-                if self.client.write_single_holding_register(address=address, value=val, slave_id=slave_id):
-                    # 更新last_actuator_states
-                    self.last_actuator_states[device_id] = val
-                else:
-                    return
-                current_states = {}
-                current_states[device_id] = self.last_actuator_states[device_id]
-                output_json = {
-                    "type": "action",
-                    "device_sn": self.mqtt.device_sn,
-                    "timestamp": int(time.time()),
-                    "control_mode": control_mode,
-                    "action": "actuator_status",
-                    "data": current_states
-                }
-                publish_topic = f"tenants/{self.mqtt_tenant_id_input.text().strip()}/devices/{self.mqtt.device_sn}/telemetry"
-                self.mqtt.publish(publish_topic, json.dumps(output_json), qos=0)
-                
+
+        if not action_data:
+            self.status_message_label.setText("Invalid action message: missing data")
+            return
+
+        if not hasattr(self, "scan_worker") or not self.scan_worker:
+            self.status_message_label.setText("Scan worker not running, action skipped")
+            return
+
+        worker_action = dict(action_data)
+        worker_action["control_mode"] = control_mode
+        self.scan_action_requested.emit(worker_action)
 
     def handle_config_message(self, data):
         updated = False
@@ -1261,11 +1221,10 @@ class MainWindow(QMainWindow):
                     
                     
             self.save_current_cfg()
+
+        if hasattr(self, "scan_worker") and self.scan_worker:
+            self.emit_scan_config_to_worker()
                     
-            if self.read_timer.isActive():
-                self.read_timer.stop()
-            if self.freq_seconds > 0:
-                self.read_timer.start(self.freq_seconds * 1000)
             
     def read_modbus_by_cfg(self):
         """ 根据当前 self.current_cfg 读取 Modbus 数据并通过 MQTT 发布结果 """
@@ -1613,42 +1572,77 @@ class MainWindow(QMainWindow):
         """打开指定继电器通道"""
         if not self._check_client_ready():
             return
+
+        if not hasattr(self, "scan_worker") or not self.scan_worker:
+            QMessageBox.warning(self, "警告", "扫描线程未启动")
+            return
+
         ch = self.relay_channel_spin.value()
-        success = self.client.write_single_coil(ch, True)
-        if success:
-            self.relay_status[ch] = True
-            self.status_message_label.setText(f"继电器 CH{ch} 已打开 (ON)")
-            self.update_coils_display()   # 刷新显示
-        else:
-            QMessageBox.warning(self, "失败", f"打开继电器 CH{ch} 失败")
+        old_state = self.relay_status[ch] if ch < len(self.relay_status) else False
+
+        # Optimistic UI: 先立刻显示 ON，失败后再回滚
+        if ch < len(self.relay_status):
+            self.set_relay_ui_state(ch, True)
+
+        self.status_message_label.setText(f"正在打开继电器 CH{ch}...")
+
+        self.relay_command_requested.emit({
+            "channel": ch,
+            "checked": True,
+            "old_state": old_state,
+        })
 
     def relay_turn_off(self):
         """关闭指定继电器通道"""
         if not self._check_client_ready():
             return
+
+        if not hasattr(self, "scan_worker") or not self.scan_worker:
+            QMessageBox.warning(self, "警告", "扫描线程未启动")
+            return
+
         ch = self.relay_channel_spin.value()
-        success = self.client.write_single_coil(ch, False)
-        if success:
-            self.relay_status[ch] = False
-            self.status_message_label.setText(f"继电器 CH{ch} 已关闭 (OFF)")
-            self.update_coils_display()
-        else:
-            QMessageBox.warning(self, "失败", f"关闭继电器 CH{ch} 失败")
+        old_state = self.relay_status[ch] if ch < len(self.relay_status) else False
+
+        # Optimistic UI: 先立刻显示 OFF，失败后再回滚
+        if ch < len(self.relay_status):
+            self.set_relay_ui_state(ch, False)
+
+        self.status_message_label.setText(f"正在关闭继电器 CH{ch}...")
+
+        self.relay_command_requested.emit({
+            "channel": ch,
+            "checked": False,
+            "old_state": old_state,
+        })
 
     def relay_toggle(self):
         """翻转指定继电器通道"""
         if not self._check_client_ready():
             return
+
+        if not hasattr(self, "scan_worker") or not self.scan_worker:
+            QMessageBox.warning(self, "警告", "扫描线程未启动")
+            return
+
         ch = self.relay_channel_spin.value()
-        # 当前状态取反
-        new_state = not self.relay_status[ch] if ch < len(self.relay_status) else True
-        success = self.client.write_single_coil(ch, new_state)
-        if success:
-            self.relay_status[ch] = new_state
-            self.status_message_label.setText(f"继电器 CH{ch} 已翻转 → {'ON' if new_state else 'OFF'}")
-            self.update_coils_display()
-        else:
-            QMessageBox.warning(self, "失败", f"翻转继电器 CH{ch} 失败")
+
+        old_state = self.relay_status[ch] if ch < len(self.relay_status) else False
+        new_state = not old_state
+
+        # Optimistic UI: 先立刻翻转显示，失败后再回滚
+        if ch < len(self.relay_status):
+            self.set_relay_ui_state(ch, new_state)
+
+        self.status_message_label.setText(
+            f"正在翻转继电器 CH{ch} → {'ON' if new_state else 'OFF'}..."
+        )
+
+        self.relay_command_requested.emit({
+            "channel": ch,
+            "checked": new_state,
+            "old_state": old_state,
+        })
 
     def relay_flash(self):
         """闪开（延时断开）"""
@@ -1724,3 +1718,206 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "警告", "请先打开串口！")
             return False
         return True
+    
+    def start_modbus_scan_worker(self):
+        if not self.client or not self.client.connected:
+            return
+
+        if hasattr(self, "scan_thread") and self.scan_thread and self.scan_thread.isRunning():
+            return
+
+        self.scan_thread = QThread(self)
+        self.scan_worker = ModbusScanWorker(client=self.client)
+
+        self.scan_worker.moveToThread(self.scan_thread)
+
+        self.scan_thread.started.connect(self.scan_worker.start_loop)
+
+        self.scan_config_updated.connect(self.scan_worker.update_config)
+        self.scan_action_requested.connect(self.scan_worker.enqueue_action)
+        self.scan_stop_requested.connect(self.scan_worker.stop_loop)
+
+        self.scan_worker.sensor_data_ready.connect(self.on_sensor_data_ready)
+        self.scan_worker.actuator_status_ready.connect(self.on_actuator_status_ready)
+        self.scan_worker.action_result_ready.connect(self.on_action_result_ready)
+        self.scan_worker.status_message.connect(self.status_message_label.setText)
+        self.scan_worker.error_occurred.connect(self.on_scan_worker_error)
+
+        self.relay_command_requested.connect(self.scan_worker.execute_relay_command)
+        self.scan_worker.relay_command_finished.connect(self.on_relay_command_finished)
+
+        self.scan_thread.start()
+
+        self.scan_config_updated.emit({
+            "cfg": self.current_cfg,
+            "freq": self.freq_seconds,
+            "actuator_cfg": self.actuator_cfg,
+            "actuator_freq": self.actuator_freq,
+        })
+
+    def stop_modbus_scan_worker(self):
+        if hasattr(self, "scan_worker") and self.scan_worker:
+            self.scan_stop_requested.emit()
+
+        if hasattr(self, "scan_thread") and self.scan_thread:
+            self.scan_thread.quit()
+            self.scan_thread.wait(3000)
+
+        self.scan_worker = None
+        self.scan_thread = None
+
+    def on_sensor_data_ready(self, result_dict):
+        self.update_realtime_display(result_dict)
+
+        output_json = {
+            "type": "data",
+            "device_sn": self.mqtt.device_sn,
+            "timestamp": int(time.time()),
+            "data": result_dict,
+        }
+
+        publish_topic = (
+            f"tenants/{self.mqtt_tenant_id_input.text().strip()}"
+            f"/devices/{self.mqtt.device_sn}/telemetry"
+        )
+
+        if not self.pause_mqtt_publish:
+            self.mqtt.publish(publish_topic, json.dumps(output_json), qos=1)
+        else:
+            self.current_output = output_json
+
+        self.status_message_label.setText(f"Read and published {len(result_dict)} tags")
+
+
+    def on_actuator_status_ready(self, current_states, changed):
+        self.last_actuator_states = current_states.copy()
+        self.update_realtime_display(None)
+
+        if changed and current_states:
+            output_json = {
+                "type": "action",
+                "device_sn": self.mqtt.device_sn,
+                "timestamp": int(time.time()),
+                "action": "actuator_status",
+                "data": current_states,
+            }
+
+            publish_topic = (
+                f"tenants/{self.mqtt_tenant_id_input.text().strip()}"
+                f"/devices/{self.mqtt.device_sn}/telemetry"
+            )
+
+            if not self.pause_mqtt_publish:
+                self.mqtt.publish(publish_topic, json.dumps(output_json), qos=1)
+                self.status_message_label.setText(f"Actuator 状态变化已上报 | {len(current_states)} 个")
+            else:
+                self.current_output = output_json
+
+
+    def on_action_result_ready(self, result):
+        device_id = result.get("device_id")
+        states = result.get("states")
+        value = result.get("value")
+        changed = result.get("changed", True)
+        control_mode = result.get("control_mode", "BINARY")
+
+        payload_data = None
+
+        if control_mode == "BINARY" and device_id and states is not None:
+            self.last_actuator_states[device_id] = states
+            self.relay_status = states[:self.coil_count_spin.value()]
+            self.update_coils_display()
+            self.update_realtime_display(None)
+            payload_data = {device_id: states}
+
+        if control_mode == "ANALOG" and device_id and value is not None:
+            self.last_actuator_states[device_id] = value
+            payload_data = {device_id: value}
+
+        if changed and payload_data is not None:
+            output_json = {
+                "type": "action",
+                "device_sn": self.mqtt.device_sn,
+                "timestamp": int(time.time()),
+                "control_mode": control_mode,
+                "action": "actuator_status",
+                "data": payload_data,
+            }
+
+            publish_topic = (
+                f"tenants/{self.mqtt_tenant_id_input.text().strip()}"
+                f"/devices/{self.mqtt.device_sn}/telemetry"
+            )
+
+            if not self.pause_mqtt_publish:
+                self.mqtt.publish(publish_topic, json.dumps(output_json), qos=0)
+
+        self.status_message_label.setText(result.get("message", "Action finished"))
+
+
+    def on_scan_worker_error(self, msg):
+        print(msg)
+        self.status_message_label.setText(msg)
+
+    def closeEvent(self, event):
+        try:
+             self.stop_modbus_scan_worker()
+
+             if self.client and self.client.connected:
+                 self.client.close()
+                 self.client = None
+
+        except Exception as e:
+            print(f"closeEvent cleanup failed: {e}")
+
+        event.accept()
+
+    def emit_scan_config_to_worker(self):
+        """把当前扫描配置同步给 ModbusScanWorker"""
+        if hasattr(self, "scan_worker") and self.scan_worker:
+            self.scan_config_updated.emit({
+                "cfg": self.current_cfg,
+                "freq": self.freq_seconds,
+                "actuator_cfg": self.actuator_cfg,
+                "actuator_freq": self.actuator_freq,
+            })
+
+    def on_relay_command_finished(self, result: dict):
+        channel = result.get("channel", 0)
+        checked = result.get("checked", False)
+        old_state = result.get("old_state", False)
+        success = result.get("success", False)
+
+        if success:
+            self.set_relay_ui_state(channel, checked)
+
+            self.status_message_label.setText(
+                f"CH{channel} 已设置为 {'ON' if checked else 'OFF'}"
+            )
+        else:
+            # 失败则恢复旧显示状态
+            self.set_relay_ui_state(channel, old_state)
+
+            error = result.get("error", "")
+            message = f"控制 CH{channel} 失败，已恢复显示状态"
+            if error:
+                message += f"\n\n错误信息: {error}"
+
+            self.status_message_label.setText(message)
+
+            QMessageBox.warning(
+                self,
+                "继电器控制失败",
+                message
+            )
+
+    def set_relay_ui_state(self, channel: int, state: bool):
+        """同步更新 relay_status 和对应 Toggle UI，不触发新的 Modbus 控制"""
+        if channel < len(self.relay_status):
+            self.relay_status[channel] = state
+
+        if hasattr(self, "relay_toggle_buttons") and channel in self.relay_toggle_buttons:
+            toggle = self.relay_toggle_buttons[channel]
+            toggle.blockSignals(True)
+            toggle.setChecked(state)
+            toggle.blockSignals(False)

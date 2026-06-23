@@ -4,6 +4,7 @@ from typing import Any, Optional, TypeVar, Callable
 import asyncio
 from pymodbus.client import AsyncModbusSerialClient, ModbusSerialClient
 from pymodbus.exceptions import ModbusException
+from PyQt5.QtCore import QObject, pyqtSignal
 import logging
 
 logging.basicConfig(
@@ -148,6 +149,8 @@ class AsyncModbusRTUClient:
             "sensor_limits:": analog_limit
         }
 
+class ModbusLogEmitter(QObject):
+    raw_log = pyqtSignal(str)
 
 class ModbusRTUClient:
     """
@@ -169,6 +172,8 @@ class ModbusRTUClient:
         self.port = port
         self.connected = False
         self.main_window = main_window
+
+        self.log_emitter = ModbusLogEmitter()
         
         # 创建同步客户端
         self.client = ModbusSerialClient(
@@ -496,14 +501,28 @@ class ModbusRTUClient:
         """读取线圈状态 (功能码 01)"""
         if slave_id is None:
             slave_id = self.slave_id
+
         try:
-            response = self.client.read_coils(address=start_addr, count=count, device_id=slave_id)
+            if not self.connected or not self.client:
+                if not self.connect():
+                    logger.warning(f"Cannot connect to read coils slave {slave_id}")
+                    return None
+
+            response = self.client.read_coils(
+                address=start_addr,
+                count=count,
+                device_id=slave_id
+            )
+
             if response.isError():
                 logger.error(f"Read coils failed: {response}")
                 return None
-            return response.bits   # 返回布尔列表
+
+            return response.bits[:count]
+
         except Exception as e:
             logger.error(f"read_coils error: {e}")
+            self.connected = False
             return None
 
     def read_discrete_inputs(self, start_addr=0, count=8, slave_id=None):
@@ -738,20 +757,18 @@ class ModbusRTUClient:
         if not self.log_enabled:
             return
         
-        if hasattr(self, 'main_window') and self.main_window:
-            # 将字节流转换为以空格分隔的规整十六进制串，例如：01 03 00 80
+        try:
             hex_str = " ".join(f"{b:02X}" for b in data)
-            
-            # 配合你主窗口的 append_log_raw 支持富文本，这里直接上色
+
             if direction == "TX":
-                # import traceback
-                # print("--- 谁在发送这条 TX？看这里的调用栈 ---")
-                # traceback.print_stack()
                 text = f"<span style='color: #00aaff;'><b>[TX] ➔</b> {hex_str}</span>"
             else:
                 text = f"<span style='color: #55ff00;'><b>[RX] ⬅</b> {hex_str}</span>"
-                
-            self.main_window.append_log_raw(text)
+
+            self.log_emitter.raw_log.emit(text)
+
+        except Exception as e:
+            logger.error(f"_log_raw_packet failed: {e}")
 
 async def main():
     temp = int_to_float(0xffdd)
